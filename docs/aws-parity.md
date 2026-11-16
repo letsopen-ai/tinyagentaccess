@@ -271,6 +271,13 @@ Other errors seen or documented:
 
 ## 7. Computer-use interfaces (tool dialects)
 
+| Local implementation | Status |
+|---|---|
+| All five dialects; per-request header on list/call; native adapters | best-effort, unverified vs AWS; all schemas PROVISIONAL vendor-derived, not AWS-confirmed |
+
+Local conversion decisions are recorded in [design.md](design.md#m5-computer-use-dialect-adapters).
+
+
 Documented [D-cui]:
 
 - Selected by the `x-amzn-agentaccess-computer-use-interface-id` header on `tools/list` **and** every `tools/call`.

@@ -219,6 +219,7 @@ async fn interfaces_and_security() {
         "ANTHROPIC_COMPUTER_TOOLSET_20260801",
         "GOOGLE_COMPUTER_USE_3X_DESKTOP_V1",
         "bad",
+        "openai_computer_v1",
     ] {
         let r = value(
             &request(
@@ -233,15 +234,17 @@ async fn interfaces_and_security() {
             .await
             .2,
         );
-        if interface.is_empty() {
-            assert!(r["result"]["tools"].is_array());
+        if matches!(interface, "bad" | "openai_computer_v1") {
+            assert_eq!(r["error"]["code"], -32602);
         } else {
+            let tools = r["result"]["tools"].as_array().unwrap();
             assert_eq!(
-                r["error"]["code"],
-                if interface == "bad" { -32602 } else { -32603 }
+                tools.iter().any(|t| t["name"] == "agentaccess___type_text"),
+                interface.is_empty()
             );
         }
     }
+
     for origin in ["https://evil.example", "null", "http://localhost.evil"] {
         assert_eq!(
             request(&a, "POST", list.clone(), &[("origin", origin)])
@@ -1049,6 +1052,8 @@ async fn forwarding_errors_and_interface_independence() {
                 "x-amzn-agentaccess-computer-use-interface-id",
                 "ANTHROPIC_COMPUTER_20250124",
             ));
+            let mut unknown_headers = headers.clone();
+            unknown_headers.last_mut().unwrap().1 = "unknown";
             let (_, _, body) = request(
                 &a,
                 "POST",
@@ -1066,7 +1071,7 @@ async fn forwarding_errors_and_interface_independence() {
             } else {
                 json!({"text":"untouched","code":code})
             };
-            let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"forwarded___fixture___echo","arguments":args}}),&headers).await;
+            let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"forwarded___fixture___echo","arguments":args}}),&unknown_headers).await;
             let reply = value(&body);
             assert_eq!(reply["result"]["isError"], true);
             assert_eq!(reply["result"]["content"][0]["text"], expected);
@@ -1186,18 +1191,22 @@ async fn forwarding_idle_expiry_and_shutdown_reap_children() {
 }
 
 #[tokio::test]
-async fn disabled_forwarding_validates_interface_for_forwarded_name() {
+async fn disabled_forwarding_ignores_interface_for_forwarded_name() {
     let (_, _, body) = request(
         &app(),
         "POST",
-        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"forwarded___x___y"}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"forwarded___x___y","arguments":{"mcpSessionId":"NEW"}}}),
         &[
             ("mcp-protocol-version", MODERN),
             ("x-amzn-agentaccess-computer-use-interface-id", "bad"),
         ],
     )
     .await;
-    assert_eq!(value(&body)["error"]["code"], -32602);
+    assert_eq!(value(&body)["result"]["isError"], true);
+    assert!(value(&body)["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown tool"));
 }
 struct GrownDisplay {
     mock: MockPlatform,
@@ -1285,4 +1294,233 @@ async fn native_http_click_validates_after_geometry_refresh() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn dialect_headers_are_per_request_in_both_protocols() {
+    const H: &str = "x-amzn-agentaccess-computer-use-interface-id";
+    for modern in [false, true] {
+        let platform = Arc::new(MockPlatform::recording());
+        let server = Server::new(Config::default(), platform.clone());
+        let a = router(server.clone());
+        let sid = if modern {
+            String::new()
+        } else {
+            request(&a, "POST", init(STATEFUL[1]), &[]).await.1["mcp-session-id"]
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        let base = if modern {
+            vec![("mcp-protocol-version", MODERN)]
+        } else {
+            vec![("mcp-session-id", sid.as_str())]
+        };
+        // Same session, alternating header selection: no dialect state survives a request.
+        for selection in [
+            Some("ANTHROPIC_COMPUTER_20251124"),
+            None,
+            Some(""),
+            Some("OPENAI_COMPUTER_V1"),
+            Some("bad"),
+            None,
+        ] {
+            let mut headers = base.clone();
+            if let Some(selection) = selection {
+                headers.push((H, selection));
+            }
+            let (_, _, body) = request(
+                &a,
+                "POST",
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                &headers,
+            )
+            .await;
+            let reply = value(&body);
+            if selection == Some("bad") {
+                assert_eq!(reply["error"]["code"], -32602);
+            } else {
+                let tools = reply["result"]["tools"].as_array().unwrap();
+                assert_eq!(
+                    tools.iter().any(|t| t["name"] == "agentaccess___type_text"),
+                    selection.is_none_or(str::is_empty)
+                );
+                assert!(tools.iter().any(|t| t["name"] == "agentaccess___wait"));
+            }
+        }
+        let mut session = if modern {
+            "NEW".to_owned()
+        } else {
+            sid.clone()
+        };
+        for selection in [
+            Some("ANTHROPIC_COMPUTER_20251124"),
+            None,
+            Some(""),
+            Some("OPENAI_COMPUTER_V1"),
+            Some("bad"),
+            None,
+        ] {
+            let mut headers = base.clone();
+            if let Some(selection) = selection {
+                headers.push((H, selection));
+            }
+            let (name, mut args) = match selection {
+                Some("ANTHROPIC_COMPUTER_20251124") => {
+                    ("computer", json!({"action":"type","text":"hello"}))
+                }
+                Some("OPENAI_COMPUTER_V1") => ("computer", json!({"type":"type","text":"hello"})),
+                _ => ("agentaccess___type_text", json!({"text":"hello"})),
+            };
+            if modern {
+                args["mcpSessionId"] = json!(session);
+            }
+            let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":args}}),&headers).await;
+            let reply = value(&body);
+            if selection == Some("bad") {
+                assert_eq!(reply["error"]["code"], -32602);
+                if modern {
+                    assert_eq!(reply["error"]["data"]["mcpSessionId"], session);
+                }
+            } else {
+                assert_eq!(reply["result"]["isError"], false, "{reply}");
+                if modern {
+                    session = reply["result"]["mcpSessionId"].as_str().unwrap().to_owned();
+                }
+            }
+        }
+        assert_eq!(platform.operations.lock().unwrap().len(), 5);
+        // Hidden native desktop names cannot bypass the selected interface.
+        let mut headers = base.clone();
+        headers.push((H, "OPENAI_COMPUTER_V1"));
+        let args = if modern {
+            json!({"text":"hello","mcpSessionId":session})
+        } else {
+            json!({"text":"hello"})
+        };
+        let (_, _, body) = request(&a, "POST", call("type_text", args), &headers).await;
+        assert_eq!(value(&body)["result"]["isError"], true);
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn dialect_native_validation_cleanup_and_saving() {
+    use taa_platform::Operation;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.screenshots.save_dir = dir.path().to_string_lossy().into_owned();
+    let platform = Arc::new(MockPlatform::recording());
+    let server = Server::new(config, platform.clone());
+    let a = router(server.clone());
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
+    let sid = h["mcp-session-id"].to_str().unwrap();
+    let headers = [
+        ("mcp-session-id", sid),
+        (
+            "x-amzn-agentaccess-computer-use-interface-id",
+            "ANTHROPIC_COMPUTER_20251124",
+        ),
+    ];
+    for (args, error) in [
+        (json!({"action":"left_click","coordinate":[1280,0]}), true),
+        (json!({"action":"key","text":"ctrl+not_a_key"}), true),
+        (json!({"action":"screenshot"}), false),
+        (
+            json!({"action":"left_mouse_down","coordinate":[4,5]}),
+            false,
+        ),
+    ] {
+        let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"computer","arguments":args}}),&headers).await;
+        assert_eq!(value(&body)["result"]["isError"], error, "{body}");
+    }
+    assert_eq!(platform.operations.lock().unwrap().len(), 1);
+    let mut paths = vec![dir.path().to_owned()];
+    let mut images = 0;
+    while let Some(path) = paths.pop() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                paths.push(path);
+            } else if path.extension().is_some_and(|e| e == "png") {
+                images += 1;
+            }
+        }
+    }
+    assert_eq!(images, 1);
+    assert_eq!(
+        request(&a, "DELETE", Value::Null, &headers).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(matches!(
+        platform.operations.lock().unwrap().last(),
+        Some(Operation::ReleaseLeft)
+    ));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn dialect_permissions() {
+    let mut config = Config::default();
+    config.agent_access.computer_input = false;
+    let platform = Arc::new(MockPlatform::recording());
+    let server = Server::new(config, platform.clone());
+    let a = router(server.clone());
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
+    let sid = h["mcp-session-id"].to_str().unwrap();
+    let headers = [
+        ("mcp-session-id", sid),
+        (
+            "x-amzn-agentaccess-computer-use-interface-id",
+            "OPENAI_COMPUTER_V1",
+        ),
+    ];
+    for (args, error) in [
+        (json!({"type":"type","text":"no"}), true),
+        (json!({"type":"screenshot"}), false),
+    ] {
+        let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"computer","arguments":args}}),&headers).await;
+        assert_eq!(value(&body)["result"]["isError"], error);
+    }
+    assert!(platform.operations.lock().unwrap().is_empty());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn dialect_action_errors_are_client_errors() {
+    let platform = Arc::new(MockPlatform::recording());
+    let server = Server::new(Config::default(), platform.clone());
+    let a = router(server.clone());
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
+    let sid = h["mcp-session-id"].to_str().unwrap();
+    for (interface, args, expected) in [
+        (
+            "OPENAI_COMPUTER_V1",
+            json!({"type":"scroll","x":1,"y":2}),
+            "missing scroll_x",
+        ),
+        (
+            "OPENAI_COMPUTER_V1",
+            json!({"type":"scroll","x":1,"y":2,"scroll_x":0,"scroll_y":0}),
+            "scroll requires a nonzero scroll_x or scroll_y",
+        ),
+        (
+            "ANTHROPIC_COMPUTER_20251124",
+            json!({"action":"type"}),
+            "missing text",
+        ),
+    ] {
+        let (_, _, body) = request(&a, "POST", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"computer","arguments":args}}), &[
+            ("mcp-session-id", sid),
+            ("x-amzn-agentaccess-computer-use-interface-id", interface),
+        ]).await;
+        let reply = value(&body);
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            format!("CLIENT_ERROR: {expected}")
+        );
+    }
+    assert!(platform.operations.lock().unwrap().is_empty());
+    server.shutdown().await;
 }

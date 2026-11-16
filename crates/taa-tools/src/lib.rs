@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dialects;
 pub mod screenshots;
 use base64::Engine;
 use config::Config;
