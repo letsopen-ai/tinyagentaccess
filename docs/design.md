@@ -1,4 +1,4 @@
-# tinyAgentAccess design (milestones 1–3)
+# tinyAgentAccess design (milestones 1–4)
 
 This is a local implementation, with no AWS SDK, credentials, cloud connection, TLS stack, or authentication. The evidence source is [aws-parity.md](aws-parity.md); this document records implementation choices, not additional claims about AWS.
 
@@ -70,14 +70,15 @@ All TOML structs deny unknown keys. Missing file/sections use defaults. Invalid 
 |---|---|
 | agent_access.computer_vision = true | Settings COMPUTER_VISION ENABLED |
 | agent_access.computer_input = true | Settings COMPUTER_INPUT ENABLED, requires vision |
-| agent_access.forward_mcp_tools = false | Settings FORWARD_MCP_TOOLS DISABLED; accepted no-op until M4 |
+| agent_access.forward_mcp_tools = false | Settings FORWARD_MCP_TOOLS DISABLED by default; true enables per-session stdio forwarding |
 | agent_access.screen_resolution = "1280x720" | ScreenResolution W_1280xH_720; local extension "native" |
 | agent_access.screen_image_format = "png" | ScreenImageFormat PNG / JPEG, lowercase TOML png/jpeg |
 | agent_access.user_control_mode = "disabled" | UserControlMode DISABLED / VIEW_ONLY / VIEW_STOP mapped to disabled/view_only/view_stop; no-op until human controls |
+| forwarding.config_path = "" | local absolute override; empty uses OS default (see M4) |
 | screenshots.save_dir = "" | local screenshot saving (M7 feature pulled into M3); absolute path or empty; never S3 |
 | bind / sessions.max_sessions / sessions.idle_timeout_secs | local transport/session settings; 780-second default inspired by image-builder timeout |
 
-AWS requires at least one enabled action; [TINY-PROPOSAL] local all-disabled is allowed for session/wait-only operation. ReplaySessionEnabled/KmsKeyArn have no local config yet.
+At least one of vision, input or forwarding must be enabled; forwarding-only is allowed. ReplaySessionEnabled/KmsKeyArn have no local config yet.
 
 ## M2 desktop decisions
 
@@ -109,4 +110,72 @@ Native key availability depends on the hardware/keymap. Fn uses a private intern
 
 ## Roadmap
 
-M3: execute_sequence stabilization waits, deadlines and session polish. M4: MCP forwarding. M5: five computer-use interface adapters. M7: local screenshot saving, replay, human stop button. Authentication comes later. Windows SendInput/GDI is included in M2 rather than deferred to M6; DXGI remains optional future work.
+M3 sequences and M4 stdio MCP forwarding are implemented. M5: five computer-use interface adapters. M7: local screenshot saving, replay, human stop button. Authentication comes later. Windows SendInput/GDI is included in M2 rather than deferred to M6; DXGI remains optional future work.
+
+## MCP tool forwarding (M4)
+
+The normative AWS behavior is [aws-parity.md §8](aws-parity.md#8-mcp-tool-forwarding).
+`taa-forward` is an Axum-independent crate: it parses the redirection file, spawns
+stdio children inheriting the parent environment, and multiplexes newline-delimited
+JSON-RPC responses by numeric request ID. A reader task dispatches oneshot responses;
+forwarded calls never acquire the desktop lock. Unknown JSON configuration keys are
+ignored with stderr warnings. Invalid encodings (including every BOM), JSON or shape
+reject the whole file. Configuration order is preserved. Names are rewritten as
+`forwarded___{server}___{tool}` without validation; ambiguous names warn, and exact
+manifest mappings route calls without splitting names. Empty or failed listings
+contribute no tools. Native sequence validation continues to reject forwarded actions.
+
+| Budget | Default | Scope |
+|---|---|---|
+| Request | 5 seconds | Each downstream call, or all pages of one listing; timeout sends notifications/cancelled |
+| Environment teardown | 15 seconds | All children concurrently |
+| Graceful child close | 1 second | Close stdin, wait, then kill and reap |
+| Initialize safety cap | 60 seconds | Local cap, independent of request budget; PROVISIONAL (not published by AWS) |
+
+`kill_on_drop` backs up explicit child teardown. Timeouts are injectable for tests.
+Downstream CallToolResult objects pass through unchanged, including structuredContent,
+_meta and isError. Locally generated failures contain one text block and isError:true:
+JSON-RPC -32600/-32601/-32602 become `CLIENT_ERROR: <message>`; other codes become
+`SERVER_ERROR: <message>`. Timeouts say `SERVER_ERROR: forwarded tool call timed out after 5s`.
+Transport failures say `SERVER_ERROR: forwarded server '<name>' is unavailable`.
+Non-object arguments produce CLIENT_ERROR; absent arguments become an empty object.
+Arguments are not checked against downstream schemas.
+
+Every local policy below is **PROVISIONAL (not published by AWS)**:
+
+- `[forwarding] config_path` overrides the redirection file location; nonempty paths
+  must be absolute. Empty selects the documented Linux/Windows defaults. The macOS
+  default is `/Library/Application Support/tinyagentaccess/mcp_server_redirection_config.json`.
+- Each stateful or stateless mcpSessionId session owns a lazy environment. The file
+  is read once on first list/call; initialization starts then. Invalid/missing files
+  warn once for that session and leave native tools available. Spawn/initialize
+  failures skip that server. No child is spawned when forwarding is disabled.
+- Stateless discovery without an existing mcpSessionId uses a temporary environment,
+  torn down in a task after listing; it does not consume a session slot. Discovery
+  with `arguments.mcpSessionId` uses that session. `NEW` on a forwarded call creates
+  a normal session environment. This accommodates session-free modern discovery.
+- DELETE, close_session and idle expiry schedule teardown outside the HTTP response
+  path. Idle expiry is polled once per second and also checked during admission.
+  Graceful process shutdown tears down environments before draining HTTP requests.
+- Initialize offers 2025-06-18, empty capabilities, clientInfo tinyAgentAccess and the
+  cargo version; known MCP versions returned by downstreams are accepted, followed
+  by notifications/initialized. A 60-second per-server safety cap bounds hangs.
+- Each upstream list refreshes every server, follows nextCursor within one request
+  budget, and rejects repeated cursors. Successful manifests replace that server's
+  cached routing map; a failed refresh exposes no tools but preserves the last
+  successful map for calls. Unknown forwarded names trigger one refresh before
+  CLIENT_ERROR Unknown tool. Collisions choose the first entry in config order and warn.
+- Exited children are unavailable to calls and respawn lazily at most once during
+  each upstream listing. A refresh triggered by an unknown name counts as a listing.
+- Tool objects pass through verbatim except name. Modern schemas additionally receive
+  the native mcpSessionId string property and required entry; that argument is stripped
+  before forwarding. Modern results receive the usual session block and result metadata.
+- The result/error relay and argument policy described above are local decisions;
+  downstream isError:true text is never rewritten.
+- Stderr is forwarded line by line with `[forwarded:<name>]`; non-JSON stdout warns
+  and is ignored. Server requests (sampling/roots/elicitation) receive -32601;
+  notifications, including tools/list_changed, are ignored because lists refresh.
+
+The Rust fixture is a normal binary so Cargo provides CARGO_BIN_EXE to integration
+tests and SDK verification can reuse it without Python in cargo tests. taa-mcp builds
+the same source as a separately named fixture binary for transport tests.

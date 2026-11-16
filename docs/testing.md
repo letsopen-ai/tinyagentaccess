@@ -53,3 +53,31 @@ The Linux cross-target CI job includes macOS ARM check and clippy for fork PRs; 
 Sequence tests cover exact rejection text and JSON rows, count/wait/text boundaries (Unicode scalars), prefixed and SAMPLE short names, nesting/unknown/gated actions, shared validators, success timing/image shape, paused-clock wait deadlines, skipped stabilization after wait, first failure and terminal capture failure. Storage tests use temporary directories for PNG/JPEG layout, Unix permissions, disabled saving, invalid paths/IDs, directory symlinks, nonfatal failures and terminal images. HTTP tests check modern ID markers on sequence success/rejection/failure, repeated close, post-close refusal and held-button release. Existing transport tests cover JSON-RPC error.data.mcpSessionId.
 
 The ignored Xvfb test now also runs move_pointer + left_click + wait + key and checks the terminal image and summary. The Python SDK script calls sequence success and rejection in both legacy/stateful and modern/stateless modes; it requires a working desktop backend for the terminal image. Start the isolated Xvfb and HTTP server described above, run `/tmp/mcpvenv/bin/python scripts/interop_python_sdk.py`, then stop both processes. Cross-target check/clippy commands above remain required for M3.
+
+## M4 forwarding
+
+`cargo test --workspace` runs portable Rust stdio fixtures, with no Python dependency.
+`taa-forward` covers encoding/shape rejection, ignored keys, config order, names,
+manifest passthrough, parallel calls, pagination, empty/failed lists, initialization
+and request timeouts, cancellation, downstream errors/crashes and actual child reaping.
+`taa-mcp` exercises forwarding through stateful and modern stateless HTTP, including
+NEW, schema injection, forwarding-only visibility, disabled forwarding, and closure.
+The fixture binaries share one source and are deliberately normal Cargo binaries so
+integration tests and SDK verification can launch exactly the same implementation.
+
+For the official Python SDK (`mcp==2.1.1`) run `scripts/verify_m4.sh`; it builds the
+server/fixture, creates absolute-path TOML and JSON configs in a temporary directory,
+starts an isolated Xvfb display and server, and runs both SDK scripts. It prints PASS
+lines for both protocol modes and exits nonzero on failure. Requires Xvfb and a Python
+interpreter with mcp installed (override `MCP_PYTHON`, default `/tmp/mcpvenv/bin/python`).
+For an already running configured server:
+
+```sh
+MCP_PYTHON=/tmp/mcpvenv/bin/python
+"$MCP_PYTHON" scripts/interop_forwarding.py --url http://127.0.0.1:8765/mcp
+```
+
+The redirection entry must be named `fixture`, command must be the absolute path to
+`target/debug/taa-fake-mcp-server`, and args must be `["good"]`. Enable forwarding in
+TOML and point forwarding.config_path at that JSON file. Keep vision/input enabled
+when running the original `interop_python_sdk.py`, which also tests screenshots.

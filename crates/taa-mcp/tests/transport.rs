@@ -896,3 +896,291 @@ async fn transport_saves_standalone_and_terminal_images() {
     }
     assert_eq!(count(tmp.path()), 2);
 }
+
+#[tokio::test]
+async fn forwarding_transport_modes() {
+    for modern in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redirect.json");
+        let pid_path = dir.path().join("pid");
+        std::fs::write(&path,json!({"mcpServers":{"fixture":{"command":env!("CARGO_BIN_EXE_taa-mcp-forward-fixture"),"args":["good","--pid-file",pid_path]}}}).to_string()).unwrap();
+        let mut config = Config::default();
+        config.agent_access.computer_vision = false;
+        config.agent_access.computer_input = false;
+        config.agent_access.forward_mcp_tools = true;
+        config.forwarding.config_path = path.to_str().unwrap().into();
+        config.validate().unwrap();
+        let server = Server::new(config, Arc::new(MockPlatform::default()));
+        let a = router(server.clone());
+        let sid = if modern {
+            String::new()
+        } else {
+            request(&a, "POST", init(STATEFUL[1]), &[]).await.1["mcp-session-id"]
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        let headers = if modern {
+            vec![("mcp-protocol-version", MODERN)]
+        } else {
+            vec![("mcp-session-id", sid.as_str())]
+        };
+        let (_, _, body) = request(
+            &a,
+            "POST",
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            &headers,
+        )
+        .await;
+        let listed = value(&body);
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        assert!(!tools
+            .iter()
+            .any(|t| t["name"] == "agentaccess___screenshot"));
+        let echo = tools
+            .iter()
+            .find(|t| t["name"] == "forwarded___fixture___echo")
+            .unwrap();
+        assert_eq!(echo["annotations"]["readOnlyHint"], true);
+        assert_eq!(echo["outputSchema"]["type"], "object");
+        assert_eq!(
+            echo["inputSchema"]["properties"]["mcpSessionId"].is_object(),
+            modern
+        );
+        let args = if modern {
+            json!({"mcpSessionId":"NEW","text":"relay"})
+        } else {
+            json!({"text":"relay"})
+        };
+        let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"forwarded___fixture___echo","arguments":args}}),&headers).await;
+        let result = value(&body);
+        assert_eq!(result["result"]["isError"], false);
+        assert_eq!(result["result"]["content"][0]["text"], "relay");
+        assert_eq!(result["result"]["_meta"]["fixture"], true);
+        let session = if modern {
+            result["result"]["mcpSessionId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            sid.clone()
+        };
+        let pid: u32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        if modern {
+            let (_, _, body) = request(
+                &a,
+                "POST",
+                call("close_session", json!({"mcpSessionId":session})),
+                &headers,
+            )
+            .await;
+            assert_eq!(value(&body)["result"]["isError"], false);
+        } else {
+            assert_eq!(request(&a, "DELETE", Value::Null, &headers).await.0, 204);
+        }
+        wait_for_process_exit(pid).await;
+        server.shutdown().await;
+    }
+}
+#[tokio::test]
+async fn forwarding_disabled_is_unknown() {
+    let a = app();
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
+    let headers = [("mcp-session-id", h["mcp-session-id"].to_str().unwrap())];
+    let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"forwarded___fixture___echo"}}),&headers).await;
+    assert_eq!(
+        value(&body)["result"]["content"][0]["text"],
+        "CLIENT_ERROR: Unknown tool"
+    );
+    let (_, _, body) = request(
+        &a,
+        "POST",
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        &headers,
+    )
+    .await;
+    assert!(!value(&body)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["name"].as_str().unwrap().starts_with("forwarded___")));
+}
+
+fn forwarding_app(mode: &str) -> (tempfile::TempDir, Arc<Server>, Router) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("forward.json");
+    std::fs::write(&path,json!({"mcpServers":{"fixture":{"command":env!("CARGO_BIN_EXE_taa-mcp-forward-fixture"),"args":[mode,"--pid-file",dir.path().join("pid")]}}}).to_string()).unwrap();
+    let mut config = Config::default();
+    config.agent_access.forward_mcp_tools = true;
+    config.sessions.idle_timeout_secs = 1;
+    config.forwarding.config_path = path.to_str().unwrap().into();
+    let server = Server::new(config, Arc::new(MockPlatform::default()));
+    let app = router(server.clone());
+    (dir, server, app)
+}
+#[tokio::test]
+async fn forwarding_errors_and_interface_independence() {
+    for modern in [false, true] {
+        for (mode, code, expected) in [
+            ("error-call", -32602, "CLIENT_ERROR: fixture error"),
+            ("error-call", -32603, "SERVER_ERROR: fixture error"),
+            (
+                "crash-on-call",
+                0,
+                "SERVER_ERROR: forwarded server 'fixture' is unavailable",
+            ),
+            ("tool-error", 0, "untouched"),
+        ] {
+            let (_dir, server, a) = forwarding_app(mode);
+            let sid = if modern {
+                String::new()
+            } else {
+                request(&a, "POST", init(STATEFUL[1]), &[]).await.1["mcp-session-id"]
+                    .to_str()
+                    .unwrap()
+                    .into()
+            };
+            let mut headers = if modern {
+                vec![("mcp-protocol-version", MODERN)]
+            } else {
+                vec![("mcp-session-id", sid.as_str())]
+            };
+            headers.push((
+                "x-amzn-agentaccess-computer-use-interface-id",
+                "ANTHROPIC_COMPUTER_20250124",
+            ));
+            let (_, _, body) = request(
+                &a,
+                "POST",
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                &headers,
+            )
+            .await;
+            assert!(value(&body)["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "forwarded___fixture___echo"));
+            let args = if modern {
+                json!({"mcpSessionId":"NEW","text":"untouched","code":code})
+            } else {
+                json!({"text":"untouched","code":code})
+            };
+            let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"forwarded___fixture___echo","arguments":args}}),&headers).await;
+            let reply = value(&body);
+            assert_eq!(reply["result"]["isError"], true);
+            assert_eq!(reply["result"]["content"][0]["text"], expected);
+            if modern {
+                assert!(reply["result"]["mcpSessionId"].is_string());
+                assert_eq!(reply["result"]["content"].as_array().unwrap().len(), 2);
+            }
+            server.shutdown().await;
+        }
+    }
+}
+#[tokio::test]
+async fn forwarding_does_not_wait_for_desktop() {
+    let (_dir, server, a) = forwarding_app("good");
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
+    let sid = h["mcp-session-id"].to_str().unwrap().to_owned();
+    let waiting = {
+        let a = a.clone();
+        let sid = sid.clone();
+        tokio::spawn(async move {
+            request(
+                &a,
+                "POST",
+                call("wait", json!({"duration":1})),
+                &[("mcp-session-id", &sid)],
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (_,_,body) = tokio::time::timeout(std::time::Duration::from_millis(500),request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"forwarded___fixture___ping"}}),&[("mcp-session-id",&sid)])).await.unwrap();
+    assert_eq!(value(&body)["result"]["isError"], false);
+    assert!(!waiting.is_finished());
+    waiting.await.unwrap();
+    server.shutdown().await;
+}
+#[test]
+fn forwarding_config_gating() {
+    assert!(Config::parse(
+        "[agent_access]\ncomputer_vision=false\ncomputer_input=false\nforward_mcp_tools=true"
+    )
+    .is_ok());
+    assert!(Config::parse(
+        "[agent_access]\ncomputer_vision=false\ncomputer_input=false\nforward_mcp_tools=false"
+    )
+    .is_err());
+    assert!(Config::parse(
+        "[agent_access]\ncomputer_vision=false\ncomputer_input=true\nforward_mcp_tools=true"
+    )
+    .is_err());
+    assert!(Config::parse("[forwarding]\nconfig_path='relative.json'").is_err());
+}
+
+fn process_is_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+    #[cfg(windows)]
+    {
+        String::from_utf8_lossy(
+            &std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .lines()
+        .any(|line| {
+            line.split(',')
+                .nth(1)
+                .is_some_and(|field| field.trim_matches('"') == pid.to_string())
+        })
+    }
+}
+async fn wait_for_process_exit(pid: u32) {
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            if !process_is_running(pid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test]
+async fn forwarding_idle_expiry_and_shutdown_reap_children() {
+    for expire in [false, true] {
+        let (dir, server, a) = forwarding_app("good");
+        let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
+        let headers = [("mcp-session-id", h["mcp-session-id"].to_str().unwrap())];
+        request(
+            &a,
+            "POST",
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            &headers,
+        )
+        .await;
+        let pid: u32 = std::fs::read_to_string(dir.path().join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(process_is_running(pid));
+        if !expire {
+            server.shutdown().await;
+        }
+        wait_for_process_exit(pid).await;
+        server.shutdown().await;
+    }
+}

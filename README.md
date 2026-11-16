@@ -57,3 +57,23 @@ save_dir = "" # or an absolute private directory, e.g. /home/me/screenshots
 ```
 
 Returned standalone and sequence terminal images are saved under `agentaccess/screenshots/year=YYYY/month=MM/day=DD/{session-id}/` using UTC epoch-millisecond filenames and the real PNG/JPEG extension. Unix directories/files use 0700/0600 when created; Windows inherits directory ACLs. Save failures warn on stderr and leave tool results intact. Relative save paths are rejected. No cloud upload occurs.
+
+### MCP tool forwarding
+
+Set `[agent_access] forward_mcp_tools = true` and optionally set
+`[forwarding] config_path = "/absolute/path/redirection.json"`. The redirection file
+must be UTF-8 without a BOM:
+
+```json
+{"mcpServers":{"example":{"command":"/absolute/path/mcp-server","args":["--stdio"]}}}
+```
+
+Only stdio is supported. Children inherit the server environment; `env`, `cwd` and
+other unknown keys are ignored with warnings. Tools appear as
+`forwarded___example___<tool>`. Lists and calls have a five-second timeout. Each MCP
+session owns its children and closes them on session expiry or closure. Forwarding-only
+operation (`computer_vision = false`, `computer_input = false`, forwarding enabled)
+is supported. Empty config_path uses `/etc/dcv/mcp_server_redirection_config.json`
+on Linux, `C:\ProgramData\NICE\dcv\mcp_server_redirection_config.json` on Windows,
+and the provisional `/Library/Application Support/tinyagentaccess/mcp_server_redirection_config.json`
+on macOS. See [design decisions](docs/design.md#mcp-tool-forwarding-m4).
