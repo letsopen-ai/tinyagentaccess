@@ -4,13 +4,17 @@ computer_vision = true
 computer_input = true
 forward_mcp_tools = false # enable stdio tools from the redirection config (forwarding-only is allowed)
 screen_resolution = "1280x720" # or "native"
-screen_image_format = "png" # png | jpeg; real capture in milestone 2
-user_control_mode = "disabled" # view_only | view_stop | disabled; no-op in M1
+screen_image_format = "png" # png | jpeg
+user_control_mode = "disabled" # view_only | view_stop | disabled; local /observe UI, unauthenticated
 [sessions]
 max_sessions = 1
 idle_timeout_secs = 780
 [screenshots]
-save_dir = "" # local disk placeholder; milestone 7
+save_dir = "" # optional absolute private directory; returned images only (implemented in M3)
+[replay]
+# max_bytes_per_session = 104857600 # optional; unlimited by default. Stops frames; metadata/index continue.
+enabled = false # pre-action frames and metadata, local disk only; sensitive desktop contents
+save_dir = "" # required absolute private directory when enabled; no automatic retention cleanup
 [platform]
 linux_backend = "auto" # auto | wayland | x11; auto prefers Wayland, never XWayland
 

@@ -1,4 +1,4 @@
-# tinyAgentAccess design (milestones 1–4)
+# tinyAgentAccess design (milestones 1–7)
 
 This is a local implementation, with no AWS SDK, credentials, cloud connection, TLS stack, or authentication. The evidence source is [aws-parity.md](aws-parity.md); this document records implementation choices, not additional claims about AWS.
 
@@ -73,12 +73,13 @@ All TOML structs deny unknown keys. Missing file/sections use defaults. Invalid 
 | agent_access.forward_mcp_tools = false | Settings FORWARD_MCP_TOOLS DISABLED by default; true enables per-session stdio forwarding |
 | agent_access.screen_resolution = "1280x720" | ScreenResolution W_1280xH_720; local extension "native" |
 | agent_access.screen_image_format = "png" | ScreenImageFormat PNG / JPEG, lowercase TOML png/jpeg |
-| agent_access.user_control_mode = "disabled" | UserControlMode DISABLED / VIEW_ONLY / VIEW_STOP mapped to disabled/view_only/view_stop; no-op until human controls |
+| agent_access.user_control_mode = "disabled" | UserControlMode DISABLED / VIEW_ONLY / VIEW_STOP mapped to disabled/view_only/view_stop; local /observe UI (M7) |
+| replay.enabled = false / replay.save_dir = "" | TINY-PROPOSAL local ReplaySessionEnabled substitute, required absolute path when enabled; no KmsKeyArn |
 | forwarding.config_path = "" | local absolute override; empty uses OS default (see M4) |
 | screenshots.save_dir = "" | local screenshot saving (M7 feature pulled into M3); absolute path or empty; never S3 |
 | bind / sessions.max_sessions / sessions.idle_timeout_secs | local transport/session settings; 780-second default inspired by image-builder timeout |
 
-At least one of vision, input or forwarding must be enabled; forwarding-only is allowed. ReplaySessionEnabled/KmsKeyArn have no local config yet.
+At least one of vision, input or forwarding must be enabled; forwarding-only is allowed. Replay is local only; KmsKeyArn is excluded.
 
 ## M2 desktop decisions
 
@@ -110,7 +111,7 @@ Native key availability depends on the hardware/keymap. Fn uses a private intern
 
 ## Roadmap
 
-M3 sequences and M4 stdio MCP forwarding are implemented. M5: five computer-use interface adapters. M7: local screenshot saving, replay, human stop button. Authentication comes later. Windows SendInput/GDI is included in M2 rather than deferred to M6; DXGI remains optional future work.
+M3 sequences and screenshot saving, M4 stdio MCP forwarding, M5 five computer-use adapters, and M7 local replay and human stop button are implemented. Authentication comes later. Windows SendInput/GDI is included in M2 rather than deferred to M6; DXGI remains optional future work.
 
 ## MCP tool forwarding (M4)
 
@@ -251,3 +252,87 @@ Each local choice below is **PROVISIONAL**, not an AWS-confirmed behavior:
 - Permission filtering preserves screenshot-only access through single computer
   tools while refusing translated input when disabled; split tools are filtered
   by their corresponding native permission. AWS hidden-tool behavior is unknown.
+
+## M7 local replay and human control
+
+The source facts are [§4 and §9](aws-parity.md). AWS Replay Session is public preview,
+stacks only, and not listed in API_AgentAccessConfig [D-evidence]. It captures a
+whole-screen frame and tool/arguments/response/timestamp just before actions, then
+uses Bedrock, S3, KMS and cross-Region inference for its video/transcript/HTML report
+with ≤15-day AWS retention. Those services are excluded here. AWS observers use a
+streaming URL; VIEW_STOP ends access, requiring a new stack session or an image-builder
+stop/start [D-session, D-api-cfg]. We do not model image builders or streaming URLs.
+
+Each following bullet is a separate **PROVISIONAL / TINY-PROPOSAL** local choice:
+
+- **[D-evidence] Configuration:** `[replay] enabled=false` and `save_dir=""` are local,
+  denied-unknown-key fields. Enabling requires a nonempty absolute path because no
+  S3/KMS configuration applies. Replay is independent of returned screenshot saving.
+- **[D-evidence] Timing:** `replay::Context` captures the frame and writes a `before`
+  JSONL record immediately before native dispatch (screenshot calls reuse the returned frame instead); `Event::finish` appends an `after`
+  record with the same sequence and the response on success or error. A response
+  cannot exist before dispatch; the paired-record policy is isolated for replacement.
+  UTC timestamps use explicit Unix epoch milliseconds, not local wall time.
+- **[D-evidence, D-monitor] Layout/privacy:** a session's first event fixes its UTC
+  directory `agentaccess/replay/year=YYYY/month=MM/day=DD/{mcp-session-id}`;
+  `{seq}-{epoch-ms}.png|jpg` uses the actual configured format. Session components
+  use screenshot-saving's ASCII alphanumeric/hyphen validation. Sink directories
+  reject symlinks; files use exclusive creation. Unix created directories/files use
+  0700/0600, Windows inherited ACLs, with the same best-effort path-race posture as
+  screenshot saving. Existing configured ancestors may be system aliases.
+- **[D-evidence] Capture:** replay reuses the normal backend/render/encoding path
+  with `include_cursor=false` and configured resolution/format under the existing
+  desktop lock. This means the backend's whole-screen scope and existing Wayland
+  limitations apply. Capture/storage failure warns to stderr and leaves execution
+  and MCP results unchanged; a failed capture can yield metadata without a frame.
+- **[D-evidence] Coverage:** desktop calls record client name/arguments and native
+  action/arguments; sequences record each dispatched native step, not skipped steps
+  or their synthetic terminal screenshot. Wait is metadata-only to avoid unnecessary
+  capture. `get_session_info`, `close_session` and forwarded calls record metadata
+  only; forwarding retains its independent admission and never takes the desktop lock.
+  Initialize, list, raw HTTP frames and observer polls are not replay events.
+- **[D-evidence] Bounds:** optional `replay.max_bytes_per_session` defaults to unlimited. Before saving each frame, the recorder compares accumulated frame and JSONL bytes plus the new frame against the limit. Once exceeded, it logs one warning and saves metadata only. Metadata and final index remain uncapped, so this is a frame-storage budget rather than a hard total disk quota (TINY-PROPOSAL).
+- **[D-evidence] Bounds:** each argument/response JSON payload over 65,536 UTF-8
+  bytes is replaced with an explicit truncation marker, original byte count and
+  first 16,384 Unicode scalars (at most 65,536 bytes). Image-response base64 is omitted
+  because the image is a separate artifact. Screenshot calls have metadata-only before records and save their returned image on the after record, avoiding a second capture. This limits opaque forwarded
+  payloads; desktop text and screenshots may contain sensitive information. No
+  general redaction or retention deletion is promised; users own local cleanup.
+- **[D-evidence] Named secrets:** the local metadata sanitizer recursively omits common
+  fields whose normalized keys contain secret/token/password/passwd/apikey/credential/privatekey, plus exact cookie/authorization/bearer fields before truncation, to avoid
+  retaining explicitly named secrets from forwarded tools. This is best effort;
+  arbitrary text and desktop pixels are not redacted. AWS documents no redaction.
+- **[D-evidence] Finalization:** close_session, DELETE, idle expiry and observer Stop
+  finalize an escaped, script-free local `index.html` when events exist. The index
+  labels itself TINY-PROPOSAL, not an AWS/Bedrock report; no video or transcript is
+  generated. Pending forwarded responses defer finalization until completion.
+- **[D-evidence] Cancellation:** if the HTTP future disappears before a recorded
+  response exists, an explicit cancellation/unknown-outcome record is written; native
+  blocking operations already admitted may still complete. This does not invent a
+  successful/error tool result. The normal desktop-lock cancellation limitations
+  remain those of the existing worker path.
+- **[D-session, D-api-cfg] Observer substitute:** `/observe` serves a static, same-origin
+  page; `/observe/sessions` lists live IDs, `/observe/latest/{id}` returns a fresh MCP
+  image JSON, and POST `/observe/stop/{id}` closes that ID. Polls are sequential at
+  1.5 seconds after each completed request. This is local polling, not DCV or an
+  AWS streaming URL. All sessions share the local desktop. Vision-disabled servers
+  reject image capture; observation uses normal capture/consent and pins active work without resetting the agent idle timer. Polls with Sec-Fetch-Site must say same-origin; any Origin must match.
+- **[D-session] Mode policy:** disabled routes return 404; view_only has no button
+  and rejects Stop; view_stop allows Stop only for live or remembered closed IDs,
+  returning 204 idempotently and 404 for unknown IDs. The shared release/close path
+  releases held buttons, removes ownership/session state and tears down forwarding.
+  PROVISIONAL: AWS VIEW_STOP mid-action semantics are unknown. Stop marks the session stopping before waiting for the desktop lock. Sequences abort with a stopped error between steps; an admitted native action or wait may finish. Queued calls fail;
+  queued requests recheck existence and fail after closure. No local image-builder
+  stop/start or OS logout exists. A new MCP session is required to resume.
+- **[D-session] Browser safety:** observer responses disable caching; the page denies
+  framing and external resources. Existing Host/Origin checks also apply, with exact
+  Origin/Host authority matching and a required Origin for Stop. Only GET `/observe`
+  accepts user-initiated navigation with Sec-Fetch-Site `none` or `same-origin`;
+  Sec-Fetch-Mode and Sec-Fetch-Dest, when present, must be `navigate` and `document`.
+  The page rejects `cross-site` and `same-site` navigation and embedding. Polling,
+  session listing and Stop still require `same-origin` when Sec-Fetch-Site is present.
+  All observer routes require a loopback Host. No auth is added;
+  these are browser checks, not identity. Keep the unauthenticated bind on loopback.
+- **[S-retry, D-session] Disconnect notification:** no `client_disconnected` wire
+  message is emitted because its exact shape is UNKNOWN and GET/SSE is unsupported.
+  Session closure works independently, preserving close_session and HTTP DELETE.

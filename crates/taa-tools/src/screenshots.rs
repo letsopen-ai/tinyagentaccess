@@ -66,7 +66,7 @@ pub fn save_result(dir: &str, session: &str, result: &Value) {
         }
     }
 }
-fn private_dirs(path: &Path, root: &Path) -> std::io::Result<()> {
+pub(crate) fn private_dirs(path: &Path, root: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if path == root {
             // Configured ancestors may be system aliases such as macOS /var.
@@ -100,7 +100,7 @@ fn private_dirs(path: &Path, root: &Path) -> std::io::Result<()> {
     }
 }
 // Gregorian civil date from Unix days (400-year era decomposition).
-fn date(days: i64) -> (i64, i64, i64) {
+pub(crate) fn date(days: i64) -> (i64, i64, i64) {
     let z = days + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;

@@ -1,0 +1,392 @@
+use serde_json::{json, Value};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+use taa_platform::{Frame, Operation, Platform};
+use taa_tools::{
+    config::Config,
+    replay::{self, Context, Recorder},
+    SequenceLimits,
+};
+fn files(path: &Path) -> Vec<PathBuf> {
+    fs::read_dir(path)
+        .unwrap()
+        .flat_map(|e| {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                files(&p)
+            } else {
+                vec![p]
+            }
+        })
+        .collect()
+}
+struct Ordered {
+    events: Mutex<Vec<&'static str>>,
+    fail: bool,
+    root: PathBuf,
+}
+impl Platform for Ordered {
+    fn name(&self) -> &str {
+        "ordered"
+    }
+    fn screen_size(&self) -> (u32, u32) {
+        (10, 10)
+    }
+    fn capture(&self) -> Result<Frame, String> {
+        self.events.lock().unwrap().push("capture");
+        Ok(Frame::solid(10, 10, [0, 0, 0, 255]))
+    }
+    fn perform(&self, _: Operation) -> Result<(), String> {
+        self.events.lock().unwrap().push("action");
+        // The before record and frame must be published before native dispatch.
+        let log = files(&self.root)
+            .into_iter()
+            .find(|p| p.ends_with("events.jsonl"))
+            .unwrap();
+        let rows: Vec<Value> = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.last().unwrap()["phase"], "before");
+        assert!(rows.last().unwrap()["frame"].is_string());
+        if self.fail {
+            Err("injected failure".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+fn context(root: &Path) -> Context {
+    Context {
+        recorder: Recorder::new(root.to_str().unwrap().into(), "session-1".into()),
+        tool: "computer".into(),
+        arguments: json!({"action":"key","text":"a"}),
+    }
+}
+#[test]
+fn config_validation() {
+    assert!(!Config::parse("").unwrap().replay.enabled);
+    for text in [
+        "[replay]\nenabled=true",
+        "[replay]\nenabled=true\nsave_dir='relative'",
+        "[replay]\nunknown=true",
+        "[agent_access]\nuser_control_mode='invalid'",
+    ] {
+        assert!(Config::parse(text).is_err(), "{text}");
+    }
+    for mode in ["disabled", "view_only", "view_stop"] {
+        assert!(Config::parse(&format!("[agent_access]\nuser_control_mode='{mode}'")).is_ok());
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.replay.enabled = true;
+    config.replay.save_dir = tmp.path().to_str().unwrap().into();
+    assert!(config.validate().is_ok());
+}
+#[tokio::test]
+async fn before_frame_then_response_success_and_failure() {
+    for fail in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(tmp.path());
+        let p = Arc::new(Ordered {
+            events: Mutex::new(vec![]),
+            fail,
+            root: tmp.path().into(),
+        });
+        let mut c = Config::default();
+        c.agent_access.screen_resolution = "native".into();
+        let r = replay::execute("key", &json!({"keys":"a"}), &c, p.clone(), Some(&ctx)).await;
+        assert_eq!(r["isError"], fail);
+        assert_eq!(*p.events.lock().unwrap(), vec!["capture", "action"]);
+        ctx.recorder.end();
+        let all = files(tmp.path());
+        let log = all.iter().find(|p| p.ends_with("events.jsonl")).unwrap();
+        let rows: Vec<Value> = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["tool"], "computer");
+        assert_eq!(rows[0]["native_action"], "key");
+        assert_eq!(rows[1]["response"], r);
+        assert!(rows[0]["timestamp_utc_epoch_ms"].is_u64());
+        assert_eq!(rows[0]["mcp_session_id"], "session-1");
+        assert!(log
+            .parent()
+            .unwrap()
+            .join(rows[0]["frame"].as_str().unwrap())
+            .exists());
+        let index = all.iter().find(|p| p.ends_with("index.html")).unwrap();
+        assert!(fs::read_to_string(index).unwrap().contains("TINY-PROPOSAL"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in &all {
+                assert_eq!(fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+            assert_eq!(
+                fs::metadata(log.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn sequence_steps_wait_and_disabled_and_io_failures() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = context(tmp.path());
+    let p = Arc::new(taa_platform::MockPlatform::recording());
+    let mut c = Config::default();
+    c.agent_access.screen_resolution = "native".into();
+    let r=taa_tools::sequence_recorded(&json!({"actions":[{"type":"key","keys":"a"},{"type":"wait","duration":0.001},{"type":"key","keys":"b"}]}),&c,p.clone(),SequenceLimits{stabilization:std::time::Duration::ZERO,..Default::default()},Some(&ctx)).await;
+    assert_eq!(r["isError"], false);
+    ctx.recorder.end();
+    let all = files(tmp.path());
+    let log = all.iter().find(|p| p.ends_with("events.jsonl")).unwrap();
+    let rows: Vec<Value> = fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[2]["native_action"], "wait");
+    assert!(rows[2].get("frame").is_none());
+    let empty = tempfile::tempdir().unwrap();
+    let r = replay::execute("key", &json!({"keys":"a"}), &c, p.clone(), None).await;
+    assert_eq!(r["isError"], false);
+    assert!(files(empty.path()).is_empty());
+    let blocked = empty.path().join("blocked");
+    fs::write(&blocked, b"file").unwrap();
+    let bad = context(&blocked);
+    let r = replay::execute("key", &json!({"keys":"a"}), &c, p, Some(&bad)).await;
+    assert_eq!(r["isError"], false);
+}
+#[cfg(unix)]
+#[test]
+fn refuses_symlinks_and_unsafe_session_and_existing_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("agentaccess")).unwrap();
+    let ctx = context(tmp.path());
+    assert!(ctx.recorder.begin("key", &json!({}), None, None).is_none());
+    assert!(files(outside.path()).is_empty());
+    let r = Recorder::new(outside.path().to_str().unwrap().into(), "../escape".into());
+    assert!(r.begin("key", &json!({}), None, None).is_none());
+    let ctx = context(outside.path());
+    ctx.recorder
+        .begin("info", &json!({}), None, None)
+        .unwrap()
+        .finish(&json!({"ok":true}));
+    ctx.recorder.end();
+    let other = context(outside.path());
+    assert!(other
+        .recorder
+        .begin("info", &json!({}), None, None)
+        .is_none());
+}
+
+fn log_path(root: &Path) -> PathBuf {
+    files(root)
+        .into_iter()
+        .find(|p| p.ends_with("events.jsonl"))
+        .unwrap()
+}
+#[test]
+fn cancellation_sync_and_robust_escaped_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = context(tmp.path());
+    let event = ctx.recorder.begin("forwarded___pending", &json!({"text":"</pre><script>", "client_secret":"hidden", "x-api-key":"hidden", "sessionToken":"hidden", "Cookie":"hidden"}), None, None).unwrap();
+    let log = log_path(tmp.path());
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"partial malformed JSON\n")
+        .unwrap();
+    ctx.recorder.end();
+    assert!(!log.parent().unwrap().join("index.html").exists());
+    drop(event);
+    let rows = fs::read_to_string(&log).unwrap();
+    assert!(rows.contains("cancelled"));
+    assert!(!rows.contains("hidden"));
+    let index = fs::read_to_string(log.parent().unwrap().join("index.html")).unwrap();
+    assert!(index.contains("&lt;/pre&gt;&lt;script&gt;"));
+    assert!(!index.contains("</pre><script>"));
+    assert!(index.contains("img-src 'self' file: data:"));
+}
+#[tokio::test]
+async fn cancellation_async_completes_pending_finalization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = context(tmp.path());
+    let event = ctx
+        .recorder
+        .begin("forwarded___pending", &json!({}), None, None)
+        .unwrap();
+    let log = log_path(tmp.path());
+    ctx.recorder.end();
+    assert!(!log.parent().unwrap().join("index.html").exists());
+    drop(event);
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while !log.parent().unwrap().join("index.html").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(fs::read_to_string(log).unwrap().contains("cancelled"));
+}
+#[test]
+fn pending_forwarded_response_defers_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = context(tmp.path());
+    let event = ctx
+        .recorder
+        .begin("forwarded___pending", &json!({}), None, None)
+        .unwrap();
+    let log = log_path(tmp.path());
+    ctx.recorder.end();
+    assert!(!log.parent().unwrap().join("index.html").exists());
+    event.finish(&json!({"completed":true}));
+    assert!(fs::read_to_string(log.parent().unwrap().join("index.html"))
+        .unwrap()
+        .contains("completed"));
+}
+#[tokio::test]
+async fn screenshot_single_capture_and_frame_limit() {
+    for limit in [None, Some(0)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Context {
+            recorder: Recorder::with_limit(
+                tmp.path().to_str().unwrap().into(),
+                "session-1".into(),
+                limit,
+            ),
+            tool: "screenshot".into(),
+            arguments: json!({}),
+        };
+        let p = Arc::new(Ordered {
+            events: Mutex::new(vec![]),
+            fail: false,
+            root: tmp.path().into(),
+        });
+        let r = replay::execute(
+            "screenshot",
+            &json!({}),
+            &Config::default(),
+            p.clone(),
+            Some(&ctx),
+        )
+        .await;
+        assert_eq!(r["isError"], false);
+        assert_eq!(*p.events.lock().unwrap(), vec!["capture"]);
+        ctx.recorder.end();
+        let rows: Vec<Value> = fs::read_to_string(log_path(tmp.path()))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(rows[0].get("frame").is_none());
+        assert_eq!(rows[1]["frame"].is_string(), limit.is_none());
+    }
+}
+
+struct HeldCapture {
+    entered: tokio::sync::Notify,
+    release: std::sync::Barrier,
+    stopping: std::sync::atomic::AtomicBool,
+    dispatched: std::sync::atomic::AtomicUsize,
+}
+impl Platform for HeldCapture {
+    fn name(&self) -> &str {
+        "held-capture"
+    }
+    fn screen_size(&self) -> (u32, u32) {
+        (10, 10)
+    }
+    fn capture(&self) -> Result<Frame, String> {
+        self.entered.notify_one();
+        self.release.wait();
+        Ok(Frame::solid(10, 10, [0, 0, 0, 255]))
+    }
+    fn perform(&self, _: Operation) -> Result<(), String> {
+        self.dispatched
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sequence_rechecks_deadline_and_stop_after_replay_capture() {
+    for stop in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(tmp.path());
+        let p = Arc::new(HeldCapture {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Barrier::new(2),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            dispatched: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let task = {
+            let p = p.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let mut c = Config::default();
+                c.agent_access.screen_resolution = "native".into();
+                taa_tools::sequence_recorded(
+                    &json!({"actions":[{"type":"key","keys":"a"},{"type":"key","keys":"b"}]}),
+                    &c,
+                    p,
+                    SequenceLimits::default(),
+                    Some(&ctx),
+                )
+                .await
+            })
+        };
+        p.entered.notified().await;
+        // Hold capture until the condition changes. Virtual time avoids wall-clock
+        // margins, including on slow Windows CI, and exercises the full 60s limit.
+        if stop {
+            p.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        }
+        p.release.wait();
+        let response = task.await.unwrap();
+        assert_eq!(p.dispatched.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(response["isError"], true);
+        let body: Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        let reason = if stop {
+            "Session stopped by observer"
+        } else {
+            "Deadline reached before action 0"
+        };
+        assert_eq!(body["sequence_summary"]["stop_reason"], reason);
+        assert_eq!(body["sequence_summary"]["stopped_at_index"], 0);
+        assert_eq!(body["action_results"][0]["status"], "error");
+        assert_eq!(body["action_results"][1]["status"], "skipped");
+        ctx.recorder.end();
+        let rows: Vec<Value> = fs::read_to_string(log_path(tmp.path()))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["phase"], "after");
+        assert_eq!(rows[1]["response"]["isError"], true);
+        assert_eq!(rows[1]["response"]["content"][0]["text"], reason);
+    }
+}

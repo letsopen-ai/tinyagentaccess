@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dialects;
+pub mod replay;
 pub mod screenshots;
 use base64::Engine;
 use config::Config;
@@ -406,6 +407,15 @@ pub async fn sequence_with_limits(
     p: Arc<dyn Platform>,
     limits: SequenceLimits,
 ) -> Value {
+    sequence_recorded(a, c, p, limits, None).await
+}
+pub async fn sequence_recorded(
+    a: &Value,
+    c: &Config,
+    p: Arc<dyn Platform>,
+    limits: SequenceLimits,
+    replay: Option<&replay::Context>,
+) -> Value {
     let empty = vec![];
     let actions = a["actions"].as_array().unwrap_or(&empty);
     let mut reason = None;
@@ -518,6 +528,10 @@ pub async fn sequence_with_limits(
     // PROVISIONAL (not published by AWS): error/skipped statuses and failure guidance.
     for (i, a) in actions.iter().enumerate() {
         let n = short(a);
+        if stop.is_none() && p.is_stopping() {
+            stop = Some("Session stopped by observer".into());
+            stopped_at = Some(i);
+        }
         if stop.is_none() && Instant::now() >= deadline {
             stop = Some(format!("Deadline reached before action {i}"));
             stopped_at = Some(i);
@@ -528,6 +542,15 @@ pub async fn sequence_with_limits(
         }
         let mut args = a.clone();
         args.as_object_mut().unwrap().remove("type");
+        let event = if n == "wait" {
+            if let Some(context) = replay {
+                context.begin(n, &args, c, p.clone()).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let t = Instant::now();
         let r = if n == "wait" {
             let end = t + Duration::from_secs_f64(a["duration"].as_f64().unwrap());
@@ -541,8 +564,9 @@ pub async fn sequence_with_limits(
                 result("Wait completed", false)
             }
         } else {
-            execute(n, &args, c, p.clone()).await
+            replay::execute_guarded(n, &args, c, p.clone(), replay, Some((deadline, i))).await
         };
+        replay::finish(event, &r).await;
         executed += 1;
         if r["isError"] == true {
             let reason = r["content"][0]["text"].as_str().unwrap_or("Action failed");
@@ -556,6 +580,9 @@ pub async fn sequence_with_limits(
     }
     let mut contents = vec![];
     let mut terminal = None;
+    if stop.is_none() && p.is_stopping() {
+        stop = Some("Session stopped by observer".into());
+    }
     if stop.is_none() {
         if actions.last().is_some_and(|a| short(a) != "wait") {
             tokio::time::sleep_until((Instant::now() + limits.stabilization).min(deadline)).await;

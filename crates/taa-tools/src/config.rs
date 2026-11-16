@@ -6,6 +6,7 @@ pub struct Config {
     pub agent_access: AgentAccess,
     pub sessions: Sessions,
     pub screenshots: Screenshots,
+    pub replay: Replay,
     pub platform: PlatformConfig,
     pub forwarding: Forwarding,
 }
@@ -30,6 +31,13 @@ pub struct Sessions {
 pub struct Screenshots {
     pub save_dir: String,
 }
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Replay {
+    pub max_bytes_per_session: Option<u64>,
+    pub enabled: bool,
+    pub save_dir: String,
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -37,6 +45,7 @@ impl Default for Config {
             agent_access: AgentAccess::default(),
             sessions: Sessions::default(),
             screenshots: Screenshots::default(),
+            replay: Replay::default(),
             platform: PlatformConfig::default(),
             forwarding: Forwarding::default(),
         }
@@ -108,6 +117,12 @@ impl Config {
             && !std::path::Path::new(&self.screenshots.save_dir).is_absolute()
         {
             return Err("screenshots.save_dir must be absolute".into());
+        }
+        if self.replay.enabled
+            && (self.replay.save_dir.is_empty()
+                || !std::path::Path::new(&self.replay.save_dir).is_absolute())
+        {
+            return Err("replay.save_dir must be an absolute nonempty path when enabled".into());
         }
         if self.sessions.max_sessions == 0 || self.sessions.idle_timeout_secs == 0 {
             return Err("session limits must be positive".into());
