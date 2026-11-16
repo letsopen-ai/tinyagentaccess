@@ -324,3 +324,121 @@ async fn letterbox_jpeg_and_cursor_through_execute() {
         .unwrap();
     assert_eq!(&b[..2], &[0xff, 0xd8]);
 }
+
+struct StaleGeometryPlatform {
+    mock: MockPlatform,
+    geometry_calls: std::sync::atomic::AtomicUsize,
+    geometry: Result<(u32, u32), String>,
+}
+impl StaleGeometryPlatform {
+    fn new(geometry: Result<(u32, u32), String>) -> Self {
+        Self {
+            mock: MockPlatform::recording(),
+            geometry_calls: std::sync::atomic::AtomicUsize::new(0),
+            geometry,
+        }
+    }
+    fn geometry_calls(&self) -> usize {
+        self.geometry_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+impl taa_platform::Platform for StaleGeometryPlatform {
+    fn name(&self) -> &str {
+        "stale-geometry"
+    }
+    fn screen_size(&self) -> (u32, u32) {
+        (1280, 720)
+    }
+    fn capture_geometry(&self) -> Result<(u32, u32), String> {
+        self.geometry_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.geometry.clone()
+    }
+    fn capture(&self) -> Result<taa_platform::Frame, String> {
+        self.mock.capture()
+    }
+    fn perform(&self, op: taa_platform::Operation) -> Result<(), String> {
+        self.mock.perform(op)
+    }
+}
+
+#[tokio::test]
+async fn native_sequence_refreshes_stale_geometry() {
+    let mut c = Config::default();
+    c.agent_access.screen_resolution = "native".into();
+    let p = Arc::new(StaleGeometryPlatform::new(Ok((1920, 1080))));
+    let r = sequence(
+        &json!({"actions":[{"type":"agentaccess___left_click","x":1500,"y":900}]}),
+        &c,
+        p.clone(),
+    )
+    .await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(p.geometry_calls(), 2); // Preflight plus per-action revalidation.
+    assert_eq!(
+        p.mock.operations.lock().unwrap().as_slice(),
+        &[taa_platform::Operation::Click(
+            taa_platform::Point { x: 1500, y: 900 },
+            taa_platform::Button::Left,
+            1,
+            vec![],
+        )]
+    );
+}
+
+#[tokio::test]
+async fn native_sequence_rejects_outside_fresh_geometry_before_dispatch() {
+    let mut c = Config::default();
+    c.agent_access.screen_resolution = "native".into();
+    let p = Arc::new(StaleGeometryPlatform::new(Ok((1920, 1080))));
+    let r = sequence(
+        &json!({"actions":[{"type":"key","keys":"a"},{"type":"left_click","x":1950,"y":900}]}),
+        &c,
+        p.clone(),
+    )
+    .await;
+    assert_eq!(r["isError"], true);
+    let body: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["sequence_summary"]["stopped_at_index"], 1);
+    assert_eq!(body["sequence_summary"]["executed"], 0);
+    assert_eq!(
+        body["sequence_summary"]["stop_reason"],
+        "action 1: x outside screen bounds"
+    );
+    assert_eq!(p.geometry_calls(), 1);
+    assert!(p.mock.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_sequence_keyboard_and_wait_do_not_refresh_geometry() {
+    let mut c = Config::default();
+    c.agent_access.screen_resolution = "native".into();
+    for actions in [
+        json!([{"type":"key","keys":"a"},{"type":"type_text","text":"hello"}]),
+        json!([{"type":"wait","duration":0.001}]),
+    ] {
+        let p = Arc::new(StaleGeometryPlatform::new(Err("consent required".into())));
+        let r = sequence(&json!({"actions":actions}), &c, p.clone()).await;
+        assert_eq!(r["isError"], false, "{r}");
+        assert_eq!(p.geometry_calls(), 0);
+    }
+}
+
+#[tokio::test]
+async fn native_sequence_geometry_error_prevents_dispatch() {
+    let mut c = Config::default();
+    c.agent_access.screen_resolution = "native".into();
+    let p = Arc::new(StaleGeometryPlatform::new(Err(
+        "geometry unavailable".into()
+    )));
+    let r = sequence(
+        &json!({"actions":[{"type":"key","keys":"a"},{"type":"left_click","x":1500,"y":900}]}),
+        &c,
+        p.clone(),
+    )
+    .await;
+    assert_eq!(r, result("SERVER_ERROR: geometry unavailable", true));
+    assert_eq!(p.geometry_calls(), 1);
+    assert!(p.mock.calls.lock().unwrap().is_empty());
+}

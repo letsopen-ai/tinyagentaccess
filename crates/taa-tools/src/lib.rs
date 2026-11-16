@@ -249,6 +249,21 @@ pub async fn execute(n: &str, a: &Value, c: &Config, p: Arc<dyn Platform>) -> Va
         Err(e) => result(format!("SERVER_ERROR: desktop worker failed: {e}"), true),
     }
 }
+fn is_pointer(n: &str) -> bool {
+    matches!(
+        n,
+        "move_pointer"
+            | "left_click"
+            | "double_click"
+            | "triple_click"
+            | "right_click"
+            | "middle_click"
+            | "left_click_drag"
+            | "left_mouse_down"
+            | "left_mouse_up"
+            | "scroll"
+    )
+}
 fn execute_blocking(n: &str, a: &Value, c: &Config, p: &dyn Platform) -> Value {
     let native = c.agent_access.screen_resolution == "native";
     if n == "screenshot" {
@@ -272,10 +287,10 @@ fn execute_blocking(n: &str, a: &Value, c: &Config, p: &dyn Platform) -> Value {
         };
     }
     // Only pointer actions need geometry; keyboard input must not initiate Screenshot consent.
-    let geometry = if matches!(n, "key" | "hold_key" | "type_text") {
-        Ok(p.screen_size())
-    } else {
+    let geometry = if is_pointer(n) {
         p.capture_geometry()
+    } else {
+        Ok(p.screen_size())
     };
     let f = match geometry {
         Ok(s) => s,
@@ -362,6 +377,19 @@ pub async fn sequence(a: &Value, c: &Config, p: Arc<dyn Platform>) -> Value {
     if actions.len() > 20 {
         reason = Some(format!("too many actions: {} > 20", actions.len()));
     }
+    let size = if reason.is_none()
+        && c.agent_access.screen_resolution == "native"
+        && actions.iter().any(|action| is_pointer(short(action)))
+    {
+        let p = p.clone();
+        match tokio::task::spawn_blocking(move || p.capture_geometry()).await {
+            Ok(Ok(size)) => size,
+            Ok(Err(e)) => return result(format!("SERVER_ERROR: {e}"), true),
+            Err(e) => return result(format!("SERVER_ERROR: desktop worker failed: {e}"), true),
+        }
+    } else {
+        screen(c, p.as_ref())
+    };
     for (i, action) in actions.iter().enumerate() {
         if reason.is_some() {
             break;
@@ -381,7 +409,7 @@ pub async fn sequence(a: &Value, c: &Config, p: Arc<dyn Platform>) -> Value {
         {
             Err("action cannot be nested or is unavailable".into())
         } else {
-            validate(n, &args, screen(c, p.as_ref()))
+            validate(n, &args, size)
         };
         if let Err(e) = e {
             reason = Some(format!("action {i}: {e}"));
