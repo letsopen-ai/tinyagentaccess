@@ -547,7 +547,13 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             } else {
                 transport_id.into()
             };
-            let _guard = s.desktop.lock().await;
+            // Metadata uses cached atomic dimensions and must remain available during consent.
+            // Wait retains desktop serialization required by M1.
+            let _guard = if n == "get_session_info" {
+                None
+            } else {
+                Some(s.desktop.lock().await)
+            };
             if s.touch(&sid).is_none() {
                 if modern {
                     return modern_result(
@@ -578,24 +584,26 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             };
             let r = if !taa_tools::NAMES.contains(&n) || !taa_tools::visible(n, &s.config, modern) {
                 client("Unknown tool")
-            } else if let Err(e) =
-                taa_tools::validate(n, &args, taa_tools::screen(&s.config, s.platform.as_ref()))
-            {
+            } else if let Err(e) = taa_tools::validate_shape(n, &args) {
                 client(e)
             } else {
                 match n {
                     "get_session_info" => {
                         let (w, height) = taa_tools::screen(&s.config, s.platform.as_ref());
-                        result(json!({"mcpSessionId":sid,"hostname":std::env::var("HOSTNAME").or_else(|_|std::env::var("COMPUTERNAME")).unwrap_or_else(|_|"localhost".into()),"os":std::env::consts::OS,"platformBackend":s.platform.name(),"screen":{"width":w,"height":height},"protocolVersion":actual_version,"serverVersion":env!("CARGO_PKG_VERSION")}).to_string(),false)
+                        if w == 0 || height == 0 {
+                            result("SERVER_ERROR: native screen size unknown; take a screenshot to authorize capture and discover display dimensions",true)
+                        } else {
+                            result(json!({"mcpSessionId":sid,"hostname":std::env::var("HOSTNAME").or_else(|_|std::env::var("COMPUTERNAME")).unwrap_or_else(|_|"localhost".into()),"os":std::env::consts::OS,"platformBackend":s.platform.name(),"screen":{"width":w,"height":height},"protocolVersion":actual_version,"serverVersion":env!("CARGO_PKG_VERSION")}).to_string(),false)
+                        }
                     }
                     "close_session" => {
                         s.close(&sid);
                         result("Session closed", false)
                     }
                     "execute_sequence" => {
-                        taa_tools::sequence(&args, &s.config, s.platform.as_ref()).await
+                        taa_tools::sequence(&args, &s.config, s.platform.clone()).await
                     }
-                    _ => taa_tools::execute(n, &args, &s.config, s.platform.as_ref()).await,
+                    _ => taa_tools::execute(n, &args, &s.config, s.platform.clone()).await,
                 }
             };
             drop(active);
@@ -630,6 +638,58 @@ mod tests {
             h,
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":format!("{PREFIX}{name}"),"arguments":args}}),
         )
+    }
+    #[tokio::test]
+    async fn metadata_does_not_wait_for_desktop_consent() {
+        let s = server();
+        let sid = s.open(STATEFUL[2]).unwrap();
+        let _pending_consent = s.desktop.lock().await;
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            call(s.clone(), &sid, "get_session_info", json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(s.sessions.lock().unwrap().open[&sid].active, 0);
+    }
+    #[tokio::test]
+    async fn native_metadata_returns_guidance_during_pending_consent() {
+        struct Pending;
+        impl taa_platform::Platform for Pending {
+            fn name(&self) -> &str {
+                "wayland-portal"
+            }
+            fn screen_size(&self) -> (u32, u32) {
+                (0, 0)
+            }
+            fn capture(&self) -> Result<taa_platform::Frame, String> {
+                panic!("metadata must never capture")
+            }
+            fn perform(&self, _: taa_platform::Operation) -> Result<(), String> {
+                panic!("metadata must never inject")
+            }
+        }
+        let mut config = Config::default();
+        config.agent_access.screen_resolution = "native".into();
+        let s = Server::new(config, Arc::new(Pending));
+        let sid = s.open(STATEFUL[2]).unwrap();
+        let _consent = s.desktop.lock().await;
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            call(s.clone(), &sid, "get_session_info", json!({})),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["result"]["isError"], true);
+        assert!(value["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("take a screenshot"));
     }
     #[tokio::test]
     async fn queued_work_cannot_run_after_close() {

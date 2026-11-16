@@ -2,6 +2,7 @@
 name = "taa-tools"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
@@ -12,3 +13,10 @@ tokio .workspace = true
 toml .workspace = true
 base64 .workspace = true
 taa-platform .workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = "0.13"
+
+[dev-dependencies.taa-platform]
+workspace = true
+features = ["test-support"]

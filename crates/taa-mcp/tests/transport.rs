@@ -745,3 +745,91 @@ async fn delete_rejects_version_mismatch_without_closing_session() {
         );
     }
 }
+
+struct GrownDisplay {
+    mock: MockPlatform,
+    refreshes: std::sync::atomic::AtomicUsize,
+}
+impl taa_platform::Platform for GrownDisplay {
+    fn name(&self) -> &str {
+        "grown-display"
+    }
+    fn screen_size(&self) -> (u32, u32) {
+        (1280, 720)
+    }
+    fn capture_geometry(&self) -> Result<(u32, u32), String> {
+        self.refreshes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok((1920, 1080))
+    }
+    fn capture(&self) -> Result<taa_platform::Frame, String> {
+        panic!("click must not capture a screenshot")
+    }
+    fn perform(&self, op: taa_platform::Operation) -> Result<(), String> {
+        taa_platform::Platform::perform(&self.mock, op)
+    }
+}
+
+#[tokio::test]
+async fn native_http_click_validates_after_geometry_refresh() {
+    for (args, error, refreshes) in [
+        (json!({"x":1500,"y":500}), None, 1),
+        (
+            json!({"x":1920,"y":500}),
+            Some("x outside screen bounds"),
+            1,
+        ),
+        (
+            json!({"x":1500,"y":1080}),
+            Some("y outside screen bounds"),
+            1,
+        ),
+        (json!({"x":"1500","y":500}), Some("invalid x"), 0),
+    ] {
+        let mut config = Config::default();
+        config.agent_access.screen_resolution = "native".into();
+        let platform = Arc::new(GrownDisplay {
+            mock: MockPlatform::recording(),
+            refreshes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let app = router(Server::new(config, platform.clone()));
+        let (status, headers, _) = request(&app, "POST", init(STATEFUL[2]), &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let sid = headers["mcp-session-id"].to_str().unwrap();
+        let (status, _, body) = request(
+            &app,
+            "POST",
+            call("left_click", args),
+            &[("mcp-session-id", sid)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let result = &value(&body)["result"];
+        assert_eq!(result["isError"], error.is_some(), "{body}");
+        assert_eq!(
+            platform.refreshes.load(std::sync::atomic::Ordering::SeqCst),
+            refreshes
+        );
+        let operations = platform.mock.operations.lock().unwrap();
+        if let Some(error) = error {
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(error),
+                "{body}"
+            );
+            assert!(operations.is_empty());
+        } else {
+            assert_eq!(
+                operations.as_slice(),
+                &[taa_platform::Operation::Click(
+                    taa_platform::Point { x: 1500, y: 500 },
+                    taa_platform::Button::Left,
+                    1,
+                    vec![],
+                )]
+            );
+        }
+    }
+}

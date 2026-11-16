@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 use taa_tools::config::Config;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,15 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!(
-        "tinyAgentAccess listening on http://{}/mcp (NO AUTH; desktop backend unavailable)",
+        "tinyAgentAccess listening on http://{}/mcp (NO AUTH)",
         listener.local_addr()?
     );
+    let backend = config.platform.linux_backend.clone();
+    let platform = tokio::task::spawn_blocking(move || taa_platform::detect(&backend)).await?;
     axum::serve(
         listener,
-        taa_mcp::router(taa_mcp::Server::new(
-            config,
-            Arc::new(taa_platform::UnavailablePlatform::default()),
-        )),
+        taa_mcp::router(taa_mcp::Server::new(config, platform)),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
