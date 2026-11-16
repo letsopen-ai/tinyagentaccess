@@ -194,8 +194,7 @@ struct Held {
 fn release_owned(platform: &Arc<dyn Platform>, held: &Mutex<Option<Held>>, id: &str) {
     let mut held = held.lock().unwrap();
     if held.as_ref().is_some_and(|h| h.owner == id) {
-        let point = held.as_ref().unwrap().point;
-        match platform.perform(taa_platform::Operation::Button(point, false, vec![])) {
+        match platform.perform(taa_platform::Operation::ReleaseLeft) {
             Ok(()) => *held = None,
             Err(e) => eprintln!("warning: session input release failed: {e}"),
         }
@@ -232,7 +231,8 @@ impl Platform for SessionPlatform {
         let result = self.inner.perform(op.clone());
         if result.is_ok() {
             match op {
-                Operation::Button(_, false, _)
+                Operation::ReleaseLeft
+                | Operation::Button(_, false, _)
                 | Operation::Drag(_, _)
                 | Operation::Click(_, Button::Left, _, _) => *held = None,
                 Operation::Move(point)
@@ -805,6 +805,17 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                 }
                 return StatusCode::NOT_FOUND.into_response();
             }
+            if _guard.is_some() {
+                // Cleanup workers may still be queued behind this request. Release an
+                // expired owner's input under our desktop lock before admitting work.
+                let owner = s.held.lock().unwrap().as_ref().map(|h| h.owner.clone());
+                if let Some(owner) = owner {
+                    let expired = !s.sessions.lock().unwrap().open.contains_key(&owner);
+                    if expired {
+                        s.release(&owner).await;
+                    }
+                }
+            }
             // Admission and closure are atomic with respect to the session map.
             // The desktop lock prevents another tool close from overtaking admission.
             let active = {
@@ -843,7 +854,7 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             } else if let Err(e) = if n == "execute_sequence" {
                 Ok(())
             } else {
-                taa_tools::validate(n, &args, taa_tools::screen(&s.config, s.platform.as_ref()))
+                taa_tools::validate_shape(n, &args)
             } {
                 client(e)
             } else {
@@ -917,6 +928,122 @@ mod tests {
         let mock = Arc::new(taa_platform::MockPlatform::recording());
         (Server::new(config, mock.clone()), mock)
     }
+    #[derive(Debug, PartialEq)]
+    enum PointerEvent {
+        Motion(taa_platform::Point),
+        Button(taa_platform::Point, bool),
+    }
+    struct PartialInput {
+        point: taa_platform::Point,
+        events: Vec<PointerEvent>,
+    }
+    impl Default for PartialInput {
+        fn default() -> Self {
+            Self {
+                point: taa_platform::Point { x: 0, y: 0 },
+                events: vec![],
+            }
+        }
+    }
+    impl taa_platform::input::Input for PartialInput {
+        fn motion(&mut self, point: taa_platform::Point) -> Result<(), String> {
+            self.point = point;
+            self.events.push(PointerEvent::Motion(point));
+            Ok(())
+        }
+        fn button(&mut self, _: taa_platform::Button, down: bool, _: u8) -> Result<(), String> {
+            self.events.push(PointerEvent::Button(self.point, down));
+            Ok(())
+        }
+        fn key(&mut self, _: taa_platform::Key, _: bool) -> Result<(), String> {
+            Err("X11: unsupported fn key".into())
+        }
+        fn scroll(&mut self, _: taa_platform::ScrollDirection, _: i64) -> Result<(), String> {
+            Ok(())
+        }
+        fn text(&mut self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    #[derive(Default)]
+    struct PartialPlatform(Mutex<PartialInput>);
+    impl Platform for PartialPlatform {
+        fn name(&self) -> &str {
+            "partial"
+        }
+        fn screen_size(&self) -> (u32, u32) {
+            (1920, 1080)
+        }
+        fn capture(&self) -> Result<taa_platform::Frame, String> {
+            Err("unused".into())
+        }
+        fn perform(&self, op: taa_platform::Operation) -> Result<(), String> {
+            taa_platform::input::perform(&mut *self.0.lock().unwrap(), op)
+        }
+    }
+    async fn partial_motion_cleanup(expire: bool) {
+        use taa_platform::{Button, Key, Operation, Point};
+        let platform = Arc::new(PartialPlatform::default());
+        let s = Server::new(Config::default(), platform.clone());
+        let id = s.open(STATEFUL[2]).unwrap();
+        let p = SessionPlatform {
+            inner: platform.clone(),
+            held: s.held.clone(),
+            owner: id.clone(),
+        };
+        let a = Point { x: 10, y: 20 };
+        let b = Point { x: 80, y: 90 };
+        p.perform(Operation::Button(a, true, vec![])).unwrap();
+        assert!(p
+            .perform(Operation::Click(b, Button::Right, 1, vec![Key(0x11000000)]))
+            .is_err());
+        if expire {
+            s.sessions
+                .lock()
+                .unwrap()
+                .open
+                .get_mut(&id)
+                .unwrap()
+                .touched = Instant::now() - Duration::from_secs(1000);
+            assert!(s.touch(&id).is_none());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if s.held.lock().unwrap().is_none() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", "localhost".parse().unwrap());
+            headers.insert("mcp-session-id", id.parse().unwrap());
+            assert_eq!(
+                delete(State(s.clone()), headers).await.status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert!(s.held.lock().unwrap().is_none());
+        assert_eq!(
+            platform.0.lock().unwrap().events,
+            vec![
+                PointerEvent::Motion(a),
+                PointerEvent::Button(a, true),
+                PointerEvent::Motion(b),
+                PointerEvent::Button(b, false),
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn close_releases_in_place_after_partial_motion_failure() {
+        partial_motion_cleanup(false).await;
+    }
+    #[tokio::test]
+    async fn expiry_releases_in_place_after_partial_motion_failure() {
+        partial_motion_cleanup(true).await;
+    }
     #[tokio::test]
     async fn close_releases_at_current_pointer_after_scroll() {
         let (s, mock) = recording_server();
@@ -949,7 +1076,7 @@ mod tests {
                     120,
                     vec![]
                 ),
-                taa_platform::Operation::Button(b, false, vec![]),
+                taa_platform::Operation::ReleaseLeft,
             ]
         );
     }
@@ -1041,6 +1168,60 @@ mod tests {
         assert!(s.held.lock().unwrap().is_none());
     }
     #[tokio::test]
+    async fn modern_new_releases_expired_button_before_move() {
+        let mut config = Config::default();
+        config.agent_access.screen_resolution = "native".into();
+        let mock = Arc::new(taa_platform::MockPlatform::recording());
+        let s = Server::new(config, mock.clone());
+        let id = s.open(MODERN).unwrap();
+        let point = taa_platform::Point { x: 10, y: 20 };
+        SessionPlatform {
+            inner: mock.clone(),
+            held: s.held.clone(),
+            owner: id.clone(),
+        }
+        .perform(taa_platform::Operation::Button(point, true, vec![]))
+        .unwrap();
+        s.sessions
+            .lock()
+            .unwrap()
+            .open
+            .get_mut(&id)
+            .unwrap()
+            .touched = Instant::now() - Duration::from_secs(1000);
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-protocol-version", MODERN.parse().unwrap());
+        headers.insert("mcp-method", "tools/call".parse().unwrap());
+        headers.insert("mcp-name", format!("{PREFIX}move_pointer").parse().unwrap());
+        // Current-thread runtime: the spawned cleanup cannot acquire the lock
+        // before this request does. No sleeps or scheduler timing assumptions.
+        let response = handle_one(
+            s,
+            headers,
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params": {"name":format!("{PREFIX}move_pointer"),
+                    "arguments":{"mcpSessionId":"NEW","x":30,"y":40},
+                    "_meta":{"io.modelcontextprotocol/protocolVersion":MODERN,
+                        "io.modelcontextprotocol/clientCapabilities":{}}}
+            }),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["result"]["isError"], false, "{result}");
+        assert_eq!(
+            mock.operations.lock().unwrap().as_slice(),
+            &[
+                taa_platform::Operation::Button(point, true, vec![]),
+                taa_platform::Operation::ReleaseLeft,
+                taa_platform::Operation::Move(taa_platform::Point { x: 30, y: 40 }),
+            ]
+        );
+    }
+    #[tokio::test]
     async fn sequence_press_is_released_by_delete() {
         let (s, mock) = recording_server();
         let id = s.open(STATEFUL[2]).unwrap();
@@ -1068,10 +1249,13 @@ mod tests {
         );
         let ops = mock.operations.lock().unwrap();
         assert_eq!(ops.len(), 2);
-        assert!(matches!((&ops[0], &ops[1]), (
-            taa_platform::Operation::Button(a, true, _),
-            taa_platform::Operation::Button(b, false, _)
-        ) if a == b));
+        assert!(matches!(
+            (&ops[0], &ops[1]),
+            (
+                taa_platform::Operation::Button(_, true, _),
+                taa_platform::Operation::ReleaseLeft
+            )
+        ));
     }
     #[tokio::test]
     async fn metadata_does_not_wait_for_desktop_consent() {

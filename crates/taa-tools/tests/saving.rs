@@ -97,3 +97,26 @@ fn refuses_directory_symlinks() {
     );
     assert!(files(outside.path()).is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn allows_symlink_ancestors_but_rejects_configured_symlink() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let alias = tmp.path().join("alias");
+    symlink(&real, &alias).unwrap();
+    let image = json!({"content":[{"type":"image","data":"eA==","mimeType":"image/png"}]});
+    for suffix in ["", "/"] {
+        save_result(&format!("{}{suffix}", alias.display()), "session", &image);
+        assert!(files(&real).is_empty());
+    }
+    fs::create_dir(real.join("configured")).unwrap();
+    save_result(
+        alias.join("configured").to_str().unwrap(),
+        "session",
+        &image,
+    );
+    assert_eq!(files(&real).len(), 1);
+}

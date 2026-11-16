@@ -1,5 +1,8 @@
 //! Typed, blocking desktop boundary. All positions are primary-display physical pixels.
+#[cfg(not(feature = "test-support"))]
 mod input;
+#[cfg(feature = "test-support")]
+pub mod input;
 pub mod keys;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -33,6 +36,8 @@ pub enum ScrollDirection {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Operation {
     Move(Point),
+    /// Release the left button at the current cursor position, without motion.
+    ReleaseLeft,
     Click(Point, Button, u8, KeyCombo),
     Button(Point, bool, KeyCombo),
     Drag(Point, Point),
@@ -152,6 +157,7 @@ mod mock {
         }
         fn perform(&self, op: Operation) -> Result<(), String> {
             let name = match &op {
+                Operation::ReleaseLeft => "left_mouse_up".into(),
                 Operation::Move(_) => "move_pointer".into(),
                 Operation::Click(_, b, n, _) => format!(
                     "click:{}:{n}",
