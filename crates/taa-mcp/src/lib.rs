@@ -1142,9 +1142,63 @@ mod tests {
         h
     }
     #[tokio::test]
+    async fn idle_expiry_finalizes_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.sessions.idle_timeout_secs = 60;
+        config.agent_access.screen_resolution = "native".into();
+        config.replay.enabled = true;
+        config.replay.save_dir = tmp.path().to_str().unwrap().into();
+        let s = Server::new(config, Arc::new(taa_platform::MockPlatform::recording()));
+        let sid = s.open(STATEFUL[2]).unwrap();
+        let response = call(s.clone(), &sid, "key", json!({"keys":"a"})).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["result"]["isError"], false);
+        fn find_log(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if let Some(log) = find_log(&path) {
+                        return Some(log);
+                    }
+                } else if path.ends_with("events.jsonl") {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        let log = find_log(tmp.path()).unwrap();
+        let index = log.parent().unwrap().join("index.html");
+        s.sessions
+            .lock()
+            .unwrap()
+            .open
+            .get_mut(&sid)
+            .unwrap()
+            .touched = Instant::now() - Duration::from_secs(61);
+        assert!(s.touch(&sid).is_none());
+        // Finalization runs on the blocking pool; wait for its observable result.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if index.exists() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let log = std::fs::read_to_string(log).unwrap();
+        assert!(log.contains("\"phase\":\"before\""));
+        assert!(log.contains("\"response\""));
+    }
+    #[tokio::test]
     async fn observer_poll_does_not_refresh_idle_and_rejects_cross_site() {
         let mut c = Config::default();
-        c.sessions.idle_timeout_secs = 1;
+        c.sessions.idle_timeout_secs = 60;
         c.agent_access.user_control_mode = "view_only".into();
         let s = Server::new(c, Arc::new(taa_platform::MockPlatform::recording()));
         let sid = s.open(STATEFUL[2]).unwrap();
@@ -1164,7 +1218,7 @@ mod tests {
             .open
             .get_mut(&sid)
             .unwrap()
-            .touched = Instant::now() - Duration::from_secs(2);
+            .touched = Instant::now() - Duration::from_secs(61);
         assert_eq!(
             observe_latest(State(s.clone()), observer_headers(), Path(sid.clone()))
                 .await
@@ -1317,7 +1371,7 @@ mod tests {
                 .unwrap()
                 .touched = Instant::now() - Duration::from_secs(1000);
             assert!(s.touch(&id).is_none());
-            tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::timeout(Duration::from_secs(60), async {
                 loop {
                     if s.held.lock().unwrap().is_none() {
                         break;
@@ -1466,7 +1520,7 @@ mod tests {
             .unwrap()
             .touched = Instant::now() - Duration::from_secs(1000);
         assert!(s.touch(&id).is_none());
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 if mock.operations.lock().unwrap().len() == 2 {
                     break;

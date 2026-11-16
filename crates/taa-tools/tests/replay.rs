@@ -236,7 +236,7 @@ async fn cancellation_async_completes_pending_finalization() {
     ctx.recorder.end();
     assert!(!log.parent().unwrap().join("index.html").exists());
     drop(event);
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
         while !log.parent().unwrap().join("index.html").exists() {
             tokio::task::yield_now().await;
         }

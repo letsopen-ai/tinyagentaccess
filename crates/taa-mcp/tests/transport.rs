@@ -1784,15 +1784,15 @@ async fn observer_modes_stop_and_transport_unchanged() {
     }
 }
 #[tokio::test]
-async fn replay_http_close_delete_stop_idle_and_disabled() {
-    for end in ["close", "delete", "stop", "idle", "disabled"] {
+async fn replay_http_close_delete_stop_and_disabled() {
+    for end in ["close", "delete", "stop", "disabled"] {
         let tmp = tempfile::tempdir().unwrap();
         let mut c = Config::default();
         c.agent_access.screen_resolution = "native".into();
         c.agent_access.user_control_mode = "view_stop".into();
         c.replay.enabled = end != "disabled";
         c.replay.save_dir = tmp.path().to_str().unwrap().into();
-        c.sessions.idle_timeout_secs = 1;
+        c.sessions.idle_timeout_secs = 60;
         let a = router(Server::new(c, Arc::new(MockPlatform::recording())));
         let modern = [("mcp-protocol-version", MODERN)];
         let sid = if end == "close" {
@@ -1843,9 +1843,6 @@ async fn replay_http_close_delete_stop_idle_and_disabled() {
                     .0,
                     204
                 );
-            }
-            "idle" => {
-                tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
             }
             _ => {
                 assert_eq!(
