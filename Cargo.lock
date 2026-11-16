@@ -990,11 +990,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "taa-forward"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "taa-mcp"
 version = "0.1.0-alpha.0"
 dependencies = [
  "axum",
  "serde_json",
+ "taa-forward",
  "taa-platform",
  "taa-tools",
  "tempfile",

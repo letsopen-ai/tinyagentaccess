@@ -51,14 +51,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let backend = config.platform.linux_backend.clone();
     let platform = tokio::task::spawn_blocking(move || taa_platform::detect(&backend)).await?;
-    axum::serve(
-        listener,
-        taa_mcp::router(taa_mcp::Server::new(config, platform)),
-    )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await?;
+    let server = taa_mcp::Server::new(config, platform);
+    axum::serve(listener, taa_mcp::router(server.clone()))
+        .with_graceful_shutdown({
+            let server = server.clone();
+            async move {
+                let _ = tokio::signal::ctrl_c().await;
+                server.shutdown().await;
+            }
+        })
+        .await?;
+    server.shutdown().await;
     Ok(())
 }
 

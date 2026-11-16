@@ -7,6 +7,7 @@ pub struct Config {
     pub sessions: Sessions,
     pub screenshots: Screenshots,
     pub platform: PlatformConfig,
+    pub forwarding: Forwarding,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -37,6 +38,7 @@ impl Default for Config {
             sessions: Sessions::default(),
             screenshots: Screenshots::default(),
             platform: PlatformConfig::default(),
+            forwarding: Forwarding::default(),
         }
     }
 }
@@ -76,6 +78,18 @@ impl Config {
                 "NO AUTHENTICATION: wildcard binds are unsafe; choose a concrete IP address".into(),
             );
         }
+        if !self.agent_access.computer_vision
+            && !self.agent_access.computer_input
+            && !self.agent_access.forward_mcp_tools
+        {
+            return Err("at least one of vision, input or forwarding must be enabled".into());
+        }
+        // PROVISIONAL (not published by AWS): explicit forwarding paths must be absolute.
+        if !self.forwarding.config_path.is_empty()
+            && !std::path::Path::new(&self.forwarding.config_path).is_absolute()
+        {
+            return Err("forwarding.config_path must be absolute".into());
+        }
         if self.agent_access.computer_input && !self.agent_access.computer_vision {
             return Err("computer_input requires computer_vision".into());
         }
@@ -111,6 +125,28 @@ impl Default for PlatformConfig {
     fn default() -> Self {
         Self {
             linux_backend: "auto".into(),
+        }
+    }
+}
+
+/// PROVISIONAL (not published by AWS): TOML location override and macOS default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Forwarding {
+    pub config_path: String,
+}
+impl Forwarding {
+    pub fn path(&self) -> std::path::PathBuf {
+        if !self.config_path.is_empty() {
+            return self.config_path.clone().into();
+        }
+        // AWS defaults: docs/aws-parity.md §8. macOS is a local extension.
+        if cfg!(target_os = "windows") {
+            r"C:\ProgramData\NICE\dcv\mcp_server_redirection_config.json".into()
+        } else if cfg!(target_os = "macos") {
+            "/Library/Application Support/tinyagentaccess/mcp_server_redirection_config.json".into()
+        } else {
+            "/etc/dcv/mcp_server_redirection_config.json".into()
         }
     }
 }

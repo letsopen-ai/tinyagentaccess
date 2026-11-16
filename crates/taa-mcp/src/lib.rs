@@ -42,6 +42,7 @@ struct Session {
     version: String,
     touched: Instant,
     active: usize,
+    forwarding: Option<Arc<taa_forward::ForwardingSet>>,
 }
 #[derive(Default)]
 struct Sessions {
@@ -57,13 +58,28 @@ pub struct Server {
 }
 impl Server {
     pub fn new(config: Config, platform: Arc<dyn Platform>) -> Arc<Self> {
-        Arc::new(Self {
+        let server = Arc::new(Self {
             config,
             platform,
             sessions: Mutex::new(Sessions::default()),
             desktop: Arc::default(),
             held: Arc::default(),
-        })
+        });
+        // PROVISIONAL (not published by AWS): poll idle expiry once per second.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let weak = Arc::downgrade(&server);
+            runtime.spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tick.tick().await;
+                    let Some(server) = weak.upgrade() else {
+                        break;
+                    };
+                    server.cleanup(&mut server.sessions.lock().unwrap());
+                }
+            });
+        }
+        server
     }
     fn cleanup(&self, s: &mut Sessions) {
         s.open.retain(|id, v| {
@@ -71,6 +87,7 @@ impl Server {
                 || v.touched.elapsed()
                     < Duration::from_secs(self.config.sessions.idle_timeout_secs);
             if !keep {
+                teardown_later(v.forwarding.clone());
                 let desktop = self.desktop.clone();
                 let held = self.held.clone();
                 let platform = self.platform.clone();
@@ -102,6 +119,13 @@ impl Server {
                 version: version.into(),
                 touched: Instant::now(),
                 active: 0,
+                // PROVISIONAL (not published by AWS): lazy, isolated per-session environment.
+                forwarding: self.config.agent_access.forward_mcp_tools.then(|| {
+                    taa_forward::ForwardingSet::new(
+                        self.config.forwarding.path(),
+                        Default::default(),
+                    )
+                }),
             },
         );
         Ok(id)
@@ -120,10 +144,43 @@ impl Server {
         let _ = tokio::task::spawn_blocking(move || release_owned(&platform, &held, &id)).await;
     }
 
+    fn forwarding(&self, id: &str) -> Option<Arc<taa_forward::ForwardingSet>> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .open
+            .get(id)
+            .and_then(|v| v.forwarding.clone())
+    }
+    pub async fn shutdown(&self) {
+        let sets: Vec<_> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .open
+            .drain()
+            .filter_map(|(_, s)| s.forwarding)
+            .collect();
+        let mut tasks = tokio::task::JoinSet::new();
+        for set in sets {
+            tasks.spawn(async move { set.teardown().await });
+        }
+        while tasks.join_next().await.is_some() {}
+    }
     fn close(&self, id: &str) {
         let mut s = self.sessions.lock().unwrap();
-        s.open.remove(id);
+        if let Some(session) = s.open.remove(id) {
+            teardown_later(session.forwarding);
+        }
         s.closed.insert(id.into(), Instant::now());
+    }
+}
+// PROVISIONAL (not published by AWS): teardown runs off the HTTP response path.
+fn teardown_later(set: Option<Arc<taa_forward::ForwardingSet>>) {
+    if let Some(set) = set {
+        tokio::spawn(async move {
+            set.teardown().await;
+        });
     }
 }
 // Operation::Button and Drag always control the left button in the shared input backend.
@@ -591,24 +648,98 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
     } else {
         None
     };
-    if matches!(method, "tools/list" | "tools/call") {
+    let forwarded_call = method == "tools/call"
+        && s.config.agent_access.forward_mcp_tools
+        && params["name"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("forwarded___"));
+    let mut native_interface = false;
+    if matches!(method, "tools/list" | "tools/call") && !forwarded_call {
         match Interface::parse(header(&h, "x-amzn-agentaccess-computer-use-interface-id")) {
             Err(e) => return request_error(modern, &id, -32602, &e, existing),
             Ok(Some(_)) => {
-                return request_error(
-                    modern,
-                    &id,
-                    -32603,
-                    "Computer-use interface is not implemented yet",
-                    existing,
-                )
+                if method == "tools/list" && s.config.agent_access.forward_mcp_tools {
+                    native_interface = true;
+                } else {
+                    return request_error(
+                        modern,
+                        &id,
+                        -32603,
+                        "Computer-use interface is not implemented yet",
+                        existing,
+                    );
+                }
             }
             _ => (),
         }
     }
     match method {
         "tools/list" => {
-            let mut r = taa_tools::list(&s.config, modern);
+            // Keep session-backed discovery alive while a slow initialize is pending.
+            let discovery_id = if modern {
+                existing.unwrap_or("")
+            } else {
+                transport_id
+            };
+            let _active_discovery = {
+                let mut sessions = s.sessions.lock().unwrap();
+                sessions.open.get_mut(discovery_id).map(|session| {
+                    session.active += 1;
+                    session.touched = Instant::now();
+                    ActiveSession(s.clone(), discovery_id.to_owned())
+                })
+            };
+            let mut r = if native_interface {
+                json!({"tools":[]})
+            } else {
+                taa_tools::list(&s.config, modern)
+            };
+            // §8: forwarded tools remain visible regardless of the interface header.
+            // PROVISIONAL (not published by AWS): modern discovery uses a short-lived
+            // environment when no mcpSessionId is supplied (list does not open sessions).
+            let attached = if modern {
+                existing.and_then(|id| s.forwarding(id))
+            } else {
+                s.forwarding(transport_id)
+            };
+            let temporary = modern && attached.is_none() && s.config.agent_access.forward_mcp_tools;
+            let set = attached.or_else(|| {
+                temporary.then(|| {
+                    taa_forward::ForwardingSet::new(s.config.forwarding.path(), Default::default())
+                })
+            });
+            if let Some(set) = set {
+                let mut forwarded = set.list().await;
+                // PROVISIONAL (not published by AWS): modern session schema injection;
+                // preserve every other downstream tool field.
+                if modern {
+                    for tool in &mut forwarded {
+                        let schema = &mut tool["inputSchema"];
+                        if !schema["properties"].is_object() {
+                            schema["properties"] = json!({});
+                        }
+                        schema["properties"]["mcpSessionId"] =
+                            taa_tools::schema("wait", true)["properties"]["mcpSessionId"].clone();
+                        if !schema["required"].is_array() {
+                            schema["required"] = json!([]);
+                        }
+                        if !schema["required"]
+                            .as_array()
+                            .unwrap()
+                            .contains(&json!("mcpSessionId"))
+                        {
+                            schema["required"]
+                                .as_array_mut()
+                                .unwrap()
+                                .push(json!("mcpSessionId"));
+                        }
+                    }
+                }
+                r["tools"].as_array_mut().unwrap().extend(forwarded);
+                if temporary {
+                    teardown_later(Some(set));
+                }
+            }
             if modern {
                 r["resultType"] = "complete".into();
                 r["ttlMs"] = json!(0);
@@ -620,6 +751,17 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             let Some(name) = params["name"].as_str() else {
                 return request_error(modern, &id, -32602, "name must be a string", existing);
             };
+            if !args.is_object()
+                && name.starts_with("forwarded___")
+                && s.config.agent_access.forward_mcp_tools
+            {
+                let failure = client("arguments must be an object");
+                return if modern {
+                    modern_result(&id, failure, "")
+                } else {
+                    rpc(&id, failure)
+                };
+            }
             let n = name.strip_prefix(PREFIX).unwrap_or("");
             let sid = if modern {
                 let Some(requested) = args["mcpSessionId"].as_str() else {
@@ -644,7 +786,7 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             };
             // Metadata uses cached atomic dimensions and must remain available during consent.
             // Wait retains desktop serialization required by M1.
-            let _guard = if n == "get_session_info" {
+            let _guard = if n == "get_session_info" || name.starts_with("forwarded___") {
                 None
             } else {
                 Some(s.desktop.lock().await)
@@ -693,7 +835,21 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                 held: s.held.clone(),
                 owner: sid.clone(),
             });
-            let r = if !taa_tools::NAMES.contains(&n) || !taa_tools::visible(n, &s.config, modern) {
+            // PROVISIONAL (not published by AWS): strip the upstream-only session
+            // argument; preserve downstream result/error objects.
+            let r = if name.starts_with("forwarded___") && s.config.agent_access.forward_mcp_tools {
+                let mut forwarded_args = args.clone();
+                if modern {
+                    forwarded_args
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("mcpSessionId");
+                }
+                match s.forwarding(&sid) {
+                    Some(set) => set.call(name, forwarded_args).await,
+                    None => client("Unknown tool"),
+                }
+            } else if !taa_tools::NAMES.contains(&n) || !taa_tools::visible(n, &s.config, modern) {
                 client("Unknown tool")
             } else if let Err(e) = if n == "execute_sequence" {
                 Ok(())
