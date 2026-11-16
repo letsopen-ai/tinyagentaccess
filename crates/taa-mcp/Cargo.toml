@@ -1,0 +1,17 @@
+[package]
+name = "taa-mcp"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json .workspace = true
+tokio .workspace = true
+axum .workspace = true
+uuid .workspace = true
+taa-tools .workspace = true
+taa-platform .workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
