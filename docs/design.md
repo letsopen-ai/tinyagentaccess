@@ -189,3 +189,60 @@ for discovery; children being initialized or listed are tracked separately so
 teardown can close and reap them before publication. Kill-on-drop remains a backstop. Interrupted downstream
 frame writes close the pipe and mark the client unavailable. Timeout cancellation
 is sent only after the complete request frame was written.
+
+## M5 computer-use dialect adapters
+
+All five dialects are **best-effort, unverified vs AWS**. The registry lives in
+`taa-tools::dialects`, with Anthropic, OpenAI and Google modules. Translation produces
+one native call, then the HTTP handler uses its existing desktop lock, session
+platform (including held-button ownership), validation, execution and screenshot
+saving. Native execute_sequence remains unchanged and takes native actions only.
+The interface header is read on each list/call, including forwarded calls; nothing
+is stored in a session. Only the 14 standard desktop tools are replaced. Existing
+session/sequence/wait tools and forwarded tools retain their schemas and behavior;
+future catalog/session native tools are retained by the filter.
+
+Each local choice below is **PROVISIONAL**, not an AWS-confirmed behavior:
+
+- All five input schemas are vendor-derived approximations, not AWS-confirmed.
+  Anthropic's single tool uses `action`, coordinates as pairs, and text for keys;
+  its toolset splits these into individual functions. This permits use with
+  vendor clients until captured AWS schemas are available.
+- ANTHROPIC_COMPUTER_20250124 uses the same single `computer` adapter as 20251124,
+  including its action set, because §7.3 gives no schema or mapping. Shared code
+  makes this easy to replace when evidence arrives.
+- Stateless dialect schemas require `mcpSessionId`, just like native tools;
+  translation strips it and results use the existing session envelope. AWS support
+  is unknown; this preserves usable local stateless behavior.
+- Anthropic scroll amounts and Gemini `magnitude` are notches multiplied by 120,
+  using checked integer arithmetic; directions are case-insensitive and canonicalized
+  to native title case. This uses native documented ticks without overflow.
+- Key conversion preserves xdotool names and normalizes Control/CTRL to ctrl,
+  Command/cmd/Meta/Win to super, Option to alt, Shift, Enter/Return, Esc/Escape and
+  Arrow direction aliases. OpenAI/Gemini key arrays are joined with `+` before
+  conversion; empty/non-string arrays fail. Unrecognized names reach native key
+  validation rather than inventing a platform key vocabulary.
+- OpenAI uses x/y pixels, text, keys[], button (default left), and path[]. Drag
+  paths require at least two integer points and reduce to first/last endpoints,
+  since the native action is an endpoint drag; intermediate points are not executed.
+- OpenAI scroll_x/scroll_y are signed native ticks (positive right/down); absolute
+  magnitude is checked. Both fields are required. Diagonal scroll is rejected
+  before dispatch so callers can issue separate axis calls without partial execution.
+- OpenAI wait is rejected with CLIENT_ERROR guidance to agentaccess___wait, resolving
+  the contradictory sample in favor of the documented dedicated pause tool.
+- Gemini uses x/y, destination_x/destination_y for drag, text for type, key for
+  press_key, keys[] for hotkey, and direction/magnitude for scroll. The spec leaves
+  argument names unknown; these isolated vendor-derived adapters define our local
+  contract without asserting AWS schema parity.
+- Gemini grid conversion uses nearest integer `n * (extent - 1) / 999` (integer
+  rounding), making 0 and 999 map to the first and last valid pixel. It uses the
+  configured screenshot coordinate space (1280×720 or cached native dimensions).
+  Unknown dimensions and grid values outside 0–999 fail; fresh native geometry is
+  still validated at execution. This avoids out-of-bounds inclusive endpoints.
+- Dialect argument shape failures and hidden/unknown tools return existing
+  CLIENT_ERROR tool results. Rejected Anthropic wait/zoom/cursor_position actions
+  point to agentaccess___wait even though they are absent from listings. Adapter
+  schemas reject unknown properties; native semantic validation remains authoritative.
+- Permission filtering preserves screenshot-only access through single computer
+  tools while refusing translated input when disabled; split tools are filtered
+  by their corresponding native permission. AWS hidden-tool behavior is unknown.

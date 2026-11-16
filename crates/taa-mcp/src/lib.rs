@@ -17,27 +17,7 @@ use taa_platform::Platform;
 use taa_tools::{client, config::Config, result, text, PREFIX};
 pub const MODERN: &str = "2026-07-28";
 pub const STATEFUL: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
-#[derive(Debug, Clone, Copy)]
-pub enum Interface {
-    Anthropic20250124,
-    Anthropic20251124,
-    AnthropicToolset20260801,
-    OpenaiV1,
-    Google3x,
-}
-impl Interface {
-    pub fn parse(s: &str) -> Result<Option<Self>, String> {
-        Ok(match s {
-            "" => None,
-            "ANTHROPIC_COMPUTER_20250124" => Some(Self::Anthropic20250124),
-            "ANTHROPIC_COMPUTER_20251124" => Some(Self::Anthropic20251124),
-            "ANTHROPIC_COMPUTER_TOOLSET_20260801" => Some(Self::AnthropicToolset20260801),
-            "OPENAI_COMPUTER_V1" => Some(Self::OpenaiV1),
-            "GOOGLE_COMPUTER_USE_3X_DESKTOP_V1" => Some(Self::Google3x),
-            _ => return Err("Unknown computer-use interface id".into()),
-        })
-    }
-}
+pub use taa_tools::dialects::Interface;
 struct Session {
     version: String,
     touched: Instant,
@@ -648,31 +628,14 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
     } else {
         None
     };
-    let forwarded_call = method == "tools/call"
-        && s.config.agent_access.forward_mcp_tools
-        && params["name"]
-            .as_str()
-            .is_some_and(|n| n.starts_with("forwarded___"));
-    let mut native_interface = false;
-    if matches!(method, "tools/list" | "tools/call") && !forwarded_call {
+    let interface = if matches!(method, "tools/list" | "tools/call") {
         match Interface::parse(header(&h, "x-amzn-agentaccess-computer-use-interface-id")) {
+            Ok(i) => i,
             Err(e) => return request_error(modern, &id, -32602, &e, existing),
-            Ok(Some(_)) => {
-                if method == "tools/list" && s.config.agent_access.forward_mcp_tools {
-                    native_interface = true;
-                } else {
-                    return request_error(
-                        modern,
-                        &id,
-                        -32603,
-                        "Computer-use interface is not implemented yet",
-                        existing,
-                    );
-                }
-            }
-            _ => (),
         }
-    }
+    } else {
+        None
+    };
     match method {
         "tools/list" => {
             // Keep session-backed discovery alive while a slow initialize is pending.
@@ -689,11 +652,7 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                     ActiveSession(s.clone(), discovery_id.to_owned())
                 })
             };
-            let mut r = if native_interface {
-                json!({"tools":[]})
-            } else {
-                taa_tools::list(&s.config, modern)
-            };
+            let mut r = taa_tools::dialects::list(interface, &s.config, modern);
             // §8: forwarded tools remain visible regardless of the interface header.
             // PROVISIONAL (not published by AWS): modern discovery uses a short-lived
             // environment when no mcpSessionId is supplied (list does not open sessions).
@@ -848,6 +807,20 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                 match s.forwarding(&sid) {
                     Some(set) => set.call(name, forwarded_args).await,
                     None => client("Unknown tool"),
+                }
+            } else if let Some(interface) =
+                interface.filter(|_| !taa_tools::dialects::retained(name))
+            {
+                match interface.translate(
+                    name,
+                    &args,
+                    taa_tools::screen(&s.config, platform.as_ref()),
+                ) {
+                    Ok((native, translated)) if taa_tools::visible(&native, &s.config, modern) => {
+                        taa_tools::execute(&native, &translated, &s.config, platform.clone()).await
+                    }
+                    Ok(_) => client("Unknown tool"),
+                    Err(e) => client(e),
                 }
             } else if !taa_tools::NAMES.contains(&n) || !taa_tools::visible(n, &s.config, modern) {
                 client("Unknown tool")

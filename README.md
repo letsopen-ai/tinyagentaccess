@@ -77,3 +77,13 @@ is supported. Empty config_path uses `/etc/dcv/mcp_server_redirection_config.jso
 on Linux, `C:\ProgramData\NICE\dcv\mcp_server_redirection_config.json` on Windows,
 and the provisional `/Library/Application Support/tinyagentaccess/mcp_server_redirection_config.json`
 on macOS. See [design decisions](docs/design.md#mcp-tool-forwarding-m4).
+
+Milestone 5 adds computer-use dialects selected per request with
+`x-amzn-agentaccess-computer-use-interface-id`: `ANTHROPIC_COMPUTER_20250124`,
+`ANTHROPIC_COMPUTER_20251124`, `ANTHROPIC_COMPUTER_TOOLSET_20260801`,
+`OPENAI_COMPUTER_V1`, and `GOOGLE_COMPUTER_USE_3X_DESKTOP_V1`.
+Send it on both tools/list and every tools/call. Omitted/empty selects native tools;
+unknown values return JSON-RPC -32602. Dialects are **best-effort, unverified vs AWS**;
+all schemas are **PROVISIONAL vendor-derived, not AWS-confirmed**. Only standard
+desktop tools are replaced; session, wait, sequence and forwarded tools stay available.
+See the [local conversion choices](docs/design.md#m5-computer-use-dialect-adapters).
