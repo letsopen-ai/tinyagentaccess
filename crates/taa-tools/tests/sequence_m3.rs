@@ -23,7 +23,7 @@ async fn run(actions: Value) -> Value {
     )
     .await
 }
-fn rejected(r: &Value, detail: &str, count: usize) {
+fn rejected(r: &Value, detail: &str, count: usize, at: usize) {
     assert_eq!(r["isError"], true);
     assert_eq!(r["content"].as_array().unwrap().len(), 1);
     let b = body(r);
@@ -38,6 +38,7 @@ fn rejected(r: &Value, detail: &str, count: usize) {
     assert_eq!(b["sequence_summary"]["executed"], 0);
     assert_eq!(b["sequence_summary"]["succeeded"], 0);
     assert_eq!(b["sequence_summary"]["submitted"], count);
+    assert_eq!(b["sequence_summary"]["stopped_at_index"], at);
     for row in b["action_results"].as_array().unwrap() {
         assert_eq!(row["status"], "skipped");
         assert_eq!(row["reason"], "sequence rejected before dispatch");
@@ -49,23 +50,42 @@ async fn exact_rejections_and_validation() {
         &run(json!(vec![json!({"type":"key","keys":"a"}); 21])).await,
         "too many actions: 21 > 20",
         21,
+        20,
+    );
+    for excess in [0.001, 0.0001] {
+        // All actions remain individually valid, including the sub-millisecond excess.
+        rejected(
+            &run(json!([{"type":"wait","duration":5.0},{"type":"wait","duration":4.999},{"type":"wait","duration":0.001 + excess}])).await,
+            "cumulative wait 10.0s exceeds 10.0s",
+            3,
+            2,
+        );
+    }
+    rejected(
+        &run(json!([{"type":"wait","duration":5.0},{"type":"wait","duration":5.0},{"type":"wait","duration":0.001}])).await,
+        "cumulative wait 10.0s exceeds 10.0s",
+        3,
+        2,
     );
     for duration in [json!(0.0009), json!(5.0001), json!("1"), Value::Null] {
         rejected(
             &run(json!([{"type":"wait","duration":duration}])).await,
             "action 0: wait duration must be a number between 0.001 and 5.0 seconds",
             1,
+            0,
         );
     }
     rejected(
         &run(json!([{"type":"wait"}])).await,
         "action 0: wait duration must be a number between 0.001 and 5.0 seconds",
         1,
+        0,
     );
     rejected(
         &run(json!(vec![json!({"type":"wait","duration":5}); 3])).await,
         "cumulative wait 15.0s exceeds 10.0s",
         3,
+        2,
     );
     rejected(
         &run(json!(vec![
@@ -75,13 +95,15 @@ async fn exact_rejections_and_validation() {
         .await,
         "cumulative type_text length 11000 exceeds 10000",
         2,
+        1,
     );
-    rejected(&run(json!([{"type":"type_text","text":"😀".repeat(5000)},{"type":"type_text","text":"中".repeat(5001)}])).await,"cumulative type_text length 10001 exceeds 10000",2);
+    rejected(&run(json!([{"type":"type_text","text":"😀".repeat(5000)},{"type":"type_text","text":"中".repeat(5001)}])).await,"cumulative type_text length 10001 exceeds 10000",2,1);
     for n in ["screenshot", "execute_sequence"] {
         rejected(
             &run(json!([{"type":format!("agentaccess___{n}")}])).await,
             &format!("action 0: {n} cannot be nested in execute_sequence"),
             1,
+            0,
         );
     }
     for n in [
@@ -91,7 +113,12 @@ async fn exact_rejections_and_validation() {
         "get_session_info",
         "close_session",
     ] {
-        rejected(&run(json!([{"type":n}])).await, "action 0: Unknown tool", 1);
+        rejected(
+            &run(json!([{"type":n}])).await,
+            "action 0: Unknown tool",
+            1,
+            0,
+        );
     }
     rejected(
         &run(json!([{"type":"key","keys":"bad_key"}])).await,
@@ -100,8 +127,15 @@ async fn exact_rejections_and_validation() {
             taa_tools::validate("key", &json!({"keys":"bad_key"}), (1280, 720)).unwrap_err()
         ),
         1,
+        0,
     );
-    rejected(&run(json!([])).await, "actions must not be empty", 0);
+    rejected(
+        &run(json!([{"type":"key","keys":"a"},{"type":"missing"}])).await,
+        "action 1: Unknown tool",
+        2,
+        1,
+    );
+    rejected(&run(json!([])).await, "actions must not be empty", 0, 0);
     for args in [json!({}), json!({"actions":4})] {
         let r = sequence_with_limits(
             &args,
@@ -110,7 +144,7 @@ async fn exact_rejections_and_validation() {
             limits(),
         )
         .await;
-        rejected(&r, "actions must be an array", 0);
+        rejected(&r, "actions must be an array", 0, 0);
     }
 }
 #[tokio::test]
@@ -145,6 +179,7 @@ async fn wait_boundaries_and_pause_skip() {
     // Synthetic small native image avoids runtime worker CPU affecting paused-clock assertions.
     for actions in [
         json!([{"type":"wait","duration":0.001}]),
+        json!([{"type":"wait","duration":3.0},{"type":"wait","duration":1.47},{"type":"wait","duration":4.9},{"type":"wait","duration":0.63}]),
         json!([{"type":"wait","duration":5},{"type":"wait","duration":5}]),
     ] {
         let mut c = Config::default();
@@ -280,7 +315,7 @@ async fn config_gating() {
             limits(),
         )
         .await;
-        rejected(&r, "action 0: Unknown tool", 1);
+        rejected(&r, "action 0: Unknown tool", 1, 0);
         assert!(p.calls.lock().unwrap().is_empty());
     }
 }

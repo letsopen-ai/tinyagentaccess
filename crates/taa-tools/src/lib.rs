@@ -384,6 +384,8 @@ pub async fn sequence_with_limits(
     let actions = a["actions"].as_array().unwrap_or(&empty);
     let mut reason = None;
     let mut at = 0;
+    // Allow only floating-point summation noise at the inclusive 10-second boundary.
+    const WAIT_LIMIT: f64 = 10.0 + 1e-9;
     let mut wait = 0.0;
     let mut chars = 0;
     // PROVISIONAL (not published by AWS): count first, then ordered argument checks,
@@ -430,7 +432,7 @@ pub async fn sequence_with_limits(
         if n == "wait" {
             let previous = wait;
             wait += action["duration"].as_f64().unwrap();
-            if previous <= 10.0 && wait > 10.0 {
+            if previous <= WAIT_LIMIT && wait > WAIT_LIMIT {
                 wait_crossed = i;
             }
         }
@@ -444,7 +446,7 @@ pub async fn sequence_with_limits(
         }
     }
     // The displayed wait total rounds to one decimal, independently of comparison precision.
-    if reason.is_none() && wait > 10.0 {
+    if reason.is_none() && wait > WAIT_LIMIT {
         at = wait_crossed;
         reason = Some(format!("cumulative wait {wait:.1}s exceeds 10.0s"));
     }
@@ -480,6 +482,8 @@ pub async fn sequence_with_limits(
             // Clamp in-progress waits; native blocking calls cannot safely be interrupted.
             tokio::time::sleep_until(end.min(deadline)).await;
             if Instant::now() >= deadline {
+                // PROVISIONAL: i + 1 is the first undispatched action; stopped_at_index
+                // remains i, the interrupted wait (AWS documents only the message text).
                 result(format!("Deadline reached before action {}", i + 1), true)
             } else {
                 result("Wait completed", false)

@@ -42,7 +42,6 @@ struct Session {
     version: String,
     touched: Instant,
     active: usize,
-    held: Arc<Mutex<Option<taa_platform::Point>>>,
 }
 #[derive(Default)]
 struct Sessions {
@@ -53,7 +52,8 @@ pub struct Server {
     pub config: Config,
     pub platform: Arc<dyn Platform>,
     sessions: Mutex<Sessions>,
-    desktop: tokio::sync::Mutex<()>,
+    desktop: Arc<tokio::sync::Mutex<()>>,
+    held: Arc<Mutex<Option<Held>>>,
 }
 impl Server {
     pub fn new(config: Config, platform: Arc<dyn Platform>) -> Arc<Self> {
@@ -61,13 +61,28 @@ impl Server {
             config,
             platform,
             sessions: Mutex::new(Sessions::default()),
-            desktop: tokio::sync::Mutex::new(()),
+            desktop: Arc::default(),
+            held: Arc::default(),
         })
     }
     fn cleanup(&self, s: &mut Sessions) {
-        s.open.retain(|_, v| {
-            v.active > 0
-                || v.touched.elapsed() < Duration::from_secs(self.config.sessions.idle_timeout_secs)
+        s.open.retain(|id, v| {
+            let keep = v.active > 0
+                || v.touched.elapsed()
+                    < Duration::from_secs(self.config.sessions.idle_timeout_secs);
+            if !keep {
+                let desktop = self.desktop.clone();
+                let held = self.held.clone();
+                let platform = self.platform.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    let _desktop = desktop.lock().await;
+                    let _ =
+                        tokio::task::spawn_blocking(move || release_owned(&platform, &held, &id))
+                            .await;
+                });
+            }
+            keep
         });
         s.closed
             .retain(|_, at| at.elapsed() < Duration::from_secs(300));
@@ -87,7 +102,6 @@ impl Server {
                 version: version.into(),
                 touched: Instant::now(),
                 active: 0,
-                held: Arc::default(),
             },
         );
         Ok(id)
@@ -100,36 +114,40 @@ impl Server {
         Some(v.version.clone())
     }
     async fn release(&self, id: &str) {
-        let held = self
-            .sessions
-            .lock()
-            .unwrap()
-            .open
-            .get(id)
-            .map(|s| s.held.clone());
-        if let Some(held) = held {
-            let p = self.platform.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Some(point) = held.lock().unwrap().take() {
-                    if let Err(e) = p.perform(taa_platform::Operation::Button(point, false, vec![]))
-                    {
-                        eprintln!("warning: session input release failed: {e}");
-                    }
-                }
-            })
-            .await;
-        }
+        let held = self.held.clone();
+        let platform = self.platform.clone();
+        let id = id.to_owned();
+        let _ = tokio::task::spawn_blocking(move || release_owned(&platform, &held, &id)).await;
     }
+
     fn close(&self, id: &str) {
         let mut s = self.sessions.lock().unwrap();
         s.open.remove(id);
         s.closed.insert(id.into(), Instant::now());
     }
 }
-// Hold-key releases synchronously in every backend; only button-down persists.
+// Operation::Button and Drag always control the left button in the shared input backend.
+// Hold-key releases synchronously; only left button-down persists.
+struct Held {
+    owner: String,
+    point: taa_platform::Point,
+}
+// Called only while holding the desktop lock. The mutex also keeps dispatch and
+// tracking together if the HTTP future is cancelled while its blocking worker runs.
+fn release_owned(platform: &Arc<dyn Platform>, held: &Mutex<Option<Held>>, id: &str) {
+    let mut held = held.lock().unwrap();
+    if held.as_ref().is_some_and(|h| h.owner == id) {
+        let point = held.as_ref().unwrap().point;
+        match platform.perform(taa_platform::Operation::Button(point, false, vec![])) {
+            Ok(()) => *held = None,
+            Err(e) => eprintln!("warning: session input release failed: {e}"),
+        }
+    }
+}
 struct SessionPlatform {
     inner: Arc<dyn Platform>,
-    held: Arc<Mutex<Option<taa_platform::Point>>>,
+    held: Arc<Mutex<Option<Held>>>,
+    owner: String,
 }
 impl Platform for SessionPlatform {
     fn name(&self) -> &str {
@@ -145,18 +163,27 @@ impl Platform for SessionPlatform {
         self.inner.capture_geometry()
     }
     fn perform(&self, op: taa_platform::Operation) -> Result<(), String> {
-        // Track before dispatch too: a partial native failure may already have pressed it.
-        if let taa_platform::Operation::Button(point, true, _) = &op {
-            *self.held.lock().unwrap() = Some(*point);
+        use taa_platform::{Button, Operation};
+        let mut held = self.held.lock().unwrap();
+        // A partial native failure may already have pressed the button.
+        if let Operation::Button(point, true, _) = &op {
+            *held = Some(Held {
+                owner: self.owner.clone(),
+                point: *point,
+            });
         }
         let result = self.inner.perform(op.clone());
         if result.is_ok() {
             match op {
-                taa_platform::Operation::Button(_, false, _)
-                | taa_platform::Operation::Drag(_, _) => *self.held.lock().unwrap() = None,
-                taa_platform::Operation::Move(point) => {
-                    if let Some(p) = self.held.lock().unwrap().as_mut() {
-                        *p = point;
+                Operation::Button(_, false, _)
+                | Operation::Drag(_, _)
+                | Operation::Click(_, Button::Left, _, _) => *held = None,
+                Operation::Move(point)
+                | Operation::Click(point, _, _, _)
+                | Operation::Button(point, true, _)
+                | Operation::Scroll(point, _, _, _) => {
+                    if let Some(h) = held.as_mut() {
+                        h.point = point;
                     }
                 }
                 _ => (),
@@ -638,7 +665,7 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             }
             // Admission and closure are atomic with respect to the session map.
             // The desktop lock prevents another tool close from overtaking admission.
-            let (active, held) = {
+            let active = {
                 let mut sessions = s.sessions.lock().unwrap();
                 let Some(session) = sessions.open.get_mut(&sid) else {
                     return if modern {
@@ -648,11 +675,12 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                     };
                 };
                 session.active += 1;
-                (ActiveSession(s.clone(), sid.clone()), session.held.clone())
+                ActiveSession(s.clone(), sid.clone())
             };
             let platform: Arc<dyn Platform> = Arc::new(SessionPlatform {
                 inner: s.platform.clone(),
-                held,
+                held: s.held.clone(),
+                owner: sid.clone(),
             });
             let r = if !taa_tools::NAMES.contains(&n) || !taa_tools::visible(n, &s.config, modern) {
                 client("Unknown tool")
@@ -726,6 +754,168 @@ mod tests {
             h,
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":format!("{PREFIX}{name}"),"arguments":args}}),
         )
+    }
+    fn recording_server() -> (Arc<Server>, Arc<taa_platform::MockPlatform>) {
+        let mut config = Config::default();
+        config.sessions.max_sessions = 2;
+        let mock = Arc::new(taa_platform::MockPlatform::recording());
+        (Server::new(config, mock.clone()), mock)
+    }
+    #[tokio::test]
+    async fn close_releases_at_current_pointer_after_scroll() {
+        let (s, mock) = recording_server();
+        let id = s.open(MODERN).unwrap();
+        let p = SessionPlatform {
+            inner: mock.clone(),
+            held: s.held.clone(),
+            owner: id.clone(),
+        };
+        let a = taa_platform::Point { x: 10, y: 20 };
+        let b = taa_platform::Point { x: 80, y: 90 };
+        p.perform(taa_platform::Operation::Button(a, true, vec![]))
+            .unwrap();
+        p.perform(taa_platform::Operation::Scroll(
+            b,
+            taa_platform::ScrollDirection::Down,
+            120,
+            vec![],
+        ))
+        .unwrap();
+        let _desktop = s.desktop.lock().await;
+        s.release(&id).await;
+        assert_eq!(
+            mock.operations.lock().unwrap().as_slice(),
+            &[
+                taa_platform::Operation::Button(a, true, vec![]),
+                taa_platform::Operation::Scroll(
+                    b,
+                    taa_platform::ScrollDirection::Down,
+                    120,
+                    vec![]
+                ),
+                taa_platform::Operation::Button(b, false, vec![]),
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn left_click_clears_held_ownership() {
+        let (s, mock) = recording_server();
+        let id = s.open(MODERN).unwrap();
+        let p = SessionPlatform {
+            inner: mock.clone(),
+            held: s.held.clone(),
+            owner: id.clone(),
+        };
+        let point = taa_platform::Point { x: 10, y: 20 };
+        p.perform(taa_platform::Operation::Button(point, true, vec![]))
+            .unwrap();
+        p.perform(taa_platform::Operation::Click(
+            point,
+            taa_platform::Button::Left,
+            1,
+            vec![],
+        ))
+        .unwrap();
+        let _desktop = s.desktop.lock().await;
+        s.release(&id).await;
+        assert_eq!(mock.operations.lock().unwrap().len(), 2);
+    }
+    #[tokio::test]
+    async fn close_only_releases_current_owner() {
+        let (s, mock) = recording_server();
+        let a = s.open(MODERN).unwrap();
+        let b = s.open(MODERN).unwrap();
+        let pa = SessionPlatform {
+            inner: mock.clone(),
+            held: s.held.clone(),
+            owner: a.clone(),
+        };
+        let pb = SessionPlatform {
+            inner: mock.clone(),
+            held: s.held.clone(),
+            owner: b.clone(),
+        };
+        let point = taa_platform::Point { x: 10, y: 20 };
+        pa.perform(taa_platform::Operation::Button(point, true, vec![]))
+            .unwrap();
+        pb.perform(taa_platform::Operation::Button(point, false, vec![]))
+            .unwrap();
+        pb.perform(taa_platform::Operation::Button(point, true, vec![]))
+            .unwrap();
+        let _desktop = s.desktop.lock().await;
+        s.release(&a).await;
+        s.close(&a);
+        assert_eq!(mock.operations.lock().unwrap().len(), 3);
+        s.release(&b).await;
+        assert_eq!(mock.operations.lock().unwrap().len(), 4);
+    }
+    #[tokio::test]
+    async fn idle_expiry_releases_owned_button() {
+        let (s, mock) = recording_server();
+        let id = s.open(MODERN).unwrap();
+        let p = SessionPlatform {
+            inner: mock.clone(),
+            held: s.held.clone(),
+            owner: id.clone(),
+        };
+        p.perform(taa_platform::Operation::Button(
+            taa_platform::Point { x: 10, y: 20 },
+            true,
+            vec![],
+        ))
+        .unwrap();
+        s.sessions
+            .lock()
+            .unwrap()
+            .open
+            .get_mut(&id)
+            .unwrap()
+            .touched = Instant::now() - Duration::from_secs(1000);
+        assert!(s.touch(&id).is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mock.operations.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(s.held.lock().unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn sequence_press_is_released_by_delete() {
+        let (s, mock) = recording_server();
+        let id = s.open(STATEFUL[2]).unwrap();
+        let response = call(
+            s.clone(),
+            &id,
+            "execute_sequence",
+            json!({"actions":[
+                {"type":"left_mouse_down","x":10,"y":20},
+                {"type":"wait","duration":0.001}
+            ]}),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["result"]["isError"], false);
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost".parse().unwrap());
+        headers.insert("mcp-session-id", id.parse().unwrap());
+        assert_eq!(
+            delete(State(s.clone()), headers).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        let ops = mock.operations.lock().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert!(matches!((&ops[0], &ops[1]), (
+            taa_platform::Operation::Button(a, true, _),
+            taa_platform::Operation::Button(b, false, _)
+        ) if a == b));
     }
     #[tokio::test]
     async fn metadata_does_not_wait_for_desktop_consent() {
