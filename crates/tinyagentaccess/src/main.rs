@@ -31,18 +31,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err(format!("unknown option {a}").into()),
         }
     }
-    let mut config = match path {
+    let config_text = match path {
         Some(p) => match std::fs::read_to_string(p) {
-            Ok(s) => Config::parse(&s)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         },
-        None => Config::default(),
+        None => None,
     };
-    if let Some(b) = bind {
-        config.bind = b;
-    }
-    config.validate()?;
+    let config = effective_config(config_text.as_deref(), bind)?;
     let addr: std::net::SocketAddr = config.bind.parse()?;
     if !addr.ip().is_loopback() {
         eprintln!("WARNING: NO AUTHENTICATION: non-loopback bind exposes desktop control. Do not expose this server.");
@@ -64,4 +61,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
     Ok(())
+}
+
+fn effective_config(text: Option<&str>, bind: Option<String>) -> Result<Config, String> {
+    let mut config = match text {
+        Some(text) => toml::from_str(text).map_err(|e| e.to_string())?,
+        None => Config::default(),
+    };
+    if let Some(bind) = bind {
+        config.bind = bind;
+    }
+    config.validate()?;
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_override_validates_effective_config() {
+        let wildcard = "bind = '0.0.0.0:8765'";
+        let safe = "127.0.0.1:8765";
+        assert_eq!(
+            effective_config(Some(wildcard), Some(safe.into()))
+                .unwrap()
+                .bind,
+            safe
+        );
+        assert!(effective_config(Some(wildcard), None).is_err());
+        assert!(Config::parse(wildcard).is_err());
+        assert!(effective_config(None, Some("0.0.0.0:8765".into())).is_err());
+        for invalid in [
+            "typo = 1",
+            "[sessions]\nmax_sessions = 0",
+            "[agent_access]\ncomputer_vision = false",
+        ] {
+            assert!(effective_config(Some(invalid), Some(safe.into())).is_err());
+        }
+    }
 }

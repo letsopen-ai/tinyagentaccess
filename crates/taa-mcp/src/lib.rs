@@ -184,14 +184,21 @@ async fn delete(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
     if id.is_empty() {
         return (StatusCode::BAD_REQUEST, "Missing Mcp-Session-Id header").into_response();
     }
-    match s.touch(id) {
+    let actual_version = match s.touch(id) {
         None => return StatusCode::NOT_FOUND.into_response(),
         Some(v) if v == MODERN => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
-        _ => (),
-    }
+        Some(v) => v,
+    };
     let version = header(&h, "mcp-protocol-version");
     if !version.is_empty() && !STATEFUL.contains(&version) {
         return (StatusCode::BAD_REQUEST, "Unsupported MCP-Protocol-Version").into_response();
+    }
+    if !version.is_empty() && version != actual_version {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Protocol version does not match session",
+        )
+            .into_response();
     }
     s.close(id);
     StatusCode::NO_CONTENT.into_response()
@@ -352,6 +359,9 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
         return request_error(modern, &Value::Null, -32600, "Invalid Request", None);
     }
     let method = v["method"].as_str().unwrap();
+    if method == "initialize" && v.get("id").is_none() {
+        return StatusCode::ACCEPTED.into_response();
+    }
     let params = v.get("params").cloned().unwrap_or(json!({}));
     if !params.is_object() {
         let mut response = request_error(modern, &id, -32602, "params must be an object", None);

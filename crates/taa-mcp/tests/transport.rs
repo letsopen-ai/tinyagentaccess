@@ -29,7 +29,9 @@ async fn request(
         if body.get("params").is_none() {
             body["params"] = json!({});
         }
-        body["params"]["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":MODERN,"io.modelcontextprotocol/clientCapabilities":{}});
+        if body["params"].is_object() {
+            body["params"]["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":MODERN,"io.modelcontextprotocol/clientCapabilities":{}});
+        }
     }
     let mut b = Request::builder()
         .method(method)
@@ -670,4 +672,76 @@ async fn request_ids_params_and_legacy_handler_status() {
     .await;
     assert_eq!(st, 400);
     assert_eq!(v["error"]["code"], -32020);
+}
+
+#[tokio::test]
+async fn initialize_notifications_never_allocate_or_reply() {
+    for version in STATEFUL.into_iter().chain([MODERN, "unsupported"]) {
+        let a = app();
+        for params in [init(version)["params"].clone(), json!({}), json!([])] {
+            let notification = json!({"jsonrpc":"2.0","method":"initialize","params":params});
+            for headers in [vec![], vec![("mcp-protocol-version", version)]] {
+                let (status, headers, body) =
+                    request(&a, "POST", notification.clone(), &headers).await;
+                assert_eq!(status, StatusCode::ACCEPTED);
+                assert!(!headers.contains_key("mcp-session-id"));
+                assert!(body.is_empty());
+            }
+        }
+        let (status, headers, body) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.contains_key("mcp-session-id"));
+        assert!(value(&body).get("result").is_some());
+    }
+}
+
+#[tokio::test]
+async fn delete_rejects_version_mismatch_without_closing_session() {
+    for negotiated in STATEFUL {
+        let a = app();
+        let (_, headers, _) = request(&a, "POST", init(negotiated), &[]).await;
+        let sid = headers["mcp-session-id"].to_str().unwrap();
+        for other in STATEFUL.into_iter().filter(|v| *v != negotiated) {
+            let (status, _, _) = request(
+                &a,
+                "DELETE",
+                Value::Null,
+                &[("mcp-session-id", sid), ("mcp-protocol-version", other)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, _, body) = request(
+                &a,
+                "POST",
+                json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+                &[
+                    ("mcp-session-id", sid),
+                    ("mcp-protocol-version", negotiated),
+                ],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(value(&body)["result"], json!({}));
+        }
+        assert_eq!(
+            request(
+                &a,
+                "DELETE",
+                Value::Null,
+                &[
+                    ("mcp-session-id", sid),
+                    ("mcp-protocol-version", negotiated),
+                ]
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(&a, "DELETE", Value::Null, &[("mcp-session-id", sid)])
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
 }
