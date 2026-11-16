@@ -1524,3 +1524,285 @@ async fn dialect_action_errors_are_client_errors() {
     assert!(platform.operations.lock().unwrap().is_empty());
     server.shutdown().await;
 }
+
+async fn observer_request(
+    app: &Router,
+    method: &str,
+    path: &str,
+    origin: Option<&str>,
+) -> (StatusCode, String) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "localhost:8765");
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    (status, text)
+}
+fn replay_files(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(path)
+        .unwrap()
+        .flat_map(|e| {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                replay_files(&p)
+            } else {
+                vec![p]
+            }
+        })
+        .collect()
+}
+#[tokio::test]
+async fn observer_modes_stop_and_transport_unchanged() {
+    for mode in ["disabled", "view_only", "view_stop"] {
+        let mut c = Config::default();
+        c.agent_access.user_control_mode = mode.into();
+        c.agent_access.screen_resolution = "native".into();
+        let platform = Arc::new(MockPlatform::recording());
+        let a = router(Server::new(c, platform.clone()));
+        let (_, headers, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+        let sid = headers["mcp-session-id"].to_str().unwrap();
+        let hdr = [("mcp-session-id", sid)];
+        let (status, page) = observer_request(&a, "GET", "/observe", None).await;
+        let image = format!("/observe/latest/{sid}");
+        let stop = format!("/observe/stop/{sid}");
+        if mode == "disabled" {
+            assert_eq!(status, 404);
+            assert_eq!(
+                observer_request(&a, "GET", "/observe/sessions", None)
+                    .await
+                    .0,
+                404
+            );
+            assert_eq!(observer_request(&a, "GET", &image, None).await.0, 404);
+            assert_eq!(
+                observer_request(&a, "POST", &stop, Some("http://localhost:8765"))
+                    .await
+                    .0,
+                404
+            );
+            continue;
+        }
+        assert_eq!(status, 200);
+        assert_eq!(page.contains("<button id=stop>"), mode == "view_stop");
+        let (_, body) = observer_request(&a, "GET", "/observe/sessions", None).await;
+        assert_eq!(value(&body)["sessions"][0], sid);
+        let (st, body) = observer_request(&a, "GET", &image, None).await;
+        assert_eq!(st, 200);
+        assert_eq!(value(&body)["content"][0]["type"], "image");
+        assert_eq!(observer_request(&a, "POST", &stop, None).await.0, 403);
+        assert_eq!(
+            observer_request(&a, "POST", &stop, Some("http://evil.test"))
+                .await
+                .0,
+            403
+        );
+        assert_eq!(
+            observer_request(&a, "POST", &stop, Some("http://localhost:9999"))
+                .await
+                .0,
+            403
+        );
+        let status = observer_request(&a, "POST", &stop, Some("http://localhost:8765"))
+            .await
+            .0;
+        if mode == "view_only" {
+            assert_eq!(status, 403);
+            assert_eq!(
+                request(&a, "POST", call("key", json!({"keys":"a"})), &hdr)
+                    .await
+                    .0,
+                200
+            );
+            assert_eq!(request(&a, "DELETE", Value::Null, &hdr).await.0, 204);
+        } else {
+            assert_eq!(status, 204);
+            assert_eq!(
+                request(&a, "POST", call("key", json!({"keys":"a"})), &hdr)
+                    .await
+                    .0,
+                404
+            );
+            assert_eq!(request(&a, "DELETE", Value::Null, &hdr).await.0, 404);
+            assert_eq!(
+                observer_request(&a, "POST", &stop, Some("http://localhost:8765"))
+                    .await
+                    .0,
+                204
+            );
+            assert_eq!(
+                observer_request(
+                    &a,
+                    "POST",
+                    "/observe/stop/nonexistent",
+                    Some("http://localhost:8765")
+                )
+                .await
+                .0,
+                404
+            );
+        }
+        assert_eq!(request(&a, "GET", Value::Null, &[]).await.0, 405);
+    }
+}
+#[tokio::test]
+async fn replay_http_close_delete_stop_idle_and_disabled() {
+    for end in ["close", "delete", "stop", "idle", "disabled"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = Config::default();
+        c.agent_access.screen_resolution = "native".into();
+        c.agent_access.user_control_mode = "view_stop".into();
+        c.replay.enabled = end != "disabled";
+        c.replay.save_dir = tmp.path().to_str().unwrap().into();
+        c.sessions.idle_timeout_secs = 1;
+        let a = router(Server::new(c, Arc::new(MockPlatform::recording())));
+        let modern = [("mcp-protocol-version", MODERN)];
+        let sid = if end == "close" {
+            let (_, _, body) = request(
+                &a,
+                "POST",
+                call("key", json!({"keys":"a","mcpSessionId":"NEW"})),
+                &modern,
+            )
+            .await;
+            value(&body)["result"]["mcpSessionId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        } else {
+            let (_, h, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+            let sid = h["mcp-session-id"].to_str().unwrap().to_owned();
+            let (_, _, body) = request(
+                &a,
+                "POST",
+                call("key", json!({"keys":"a"})),
+                &[("mcp-session-id", &sid)],
+            )
+            .await;
+            assert_eq!(value(&body)["result"]["isError"], false);
+            sid
+        };
+        match end {
+            "close" => {
+                let (_, _, body) = request(
+                    &a,
+                    "POST",
+                    call("close_session", json!({"mcpSessionId":sid})),
+                    &modern,
+                )
+                .await;
+                assert_eq!(value(&body)["result"]["isError"], false);
+            }
+            "stop" => {
+                assert_eq!(
+                    observer_request(
+                        &a,
+                        "POST",
+                        &format!("/observe/stop/{sid}"),
+                        Some("http://localhost:8765")
+                    )
+                    .await
+                    .0,
+                    204
+                );
+            }
+            "idle" => {
+                tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+            }
+            _ => {
+                assert_eq!(
+                    request(&a, "DELETE", Value::Null, &[("mcp-session-id", &sid)])
+                        .await
+                        .0,
+                    204
+                );
+            }
+        }
+        if end == "disabled" {
+            assert!(replay_files(tmp.path()).is_empty());
+            continue;
+        }
+        let all = replay_files(tmp.path());
+        assert!(
+            all.iter().any(|p| p.ends_with("index.html")),
+            "{end}: {all:?}"
+        );
+        let log = all.iter().find(|p| p.ends_with("events.jsonl")).unwrap();
+        let log = std::fs::read_to_string(log).unwrap();
+        assert!(log.contains("\"phase\":\"before\""));
+        assert!(log.contains("\"response\""));
+        if end == "close" {
+            assert!(log.contains("agentaccess___close_session"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn replay_translated_and_forwarded_metadata_and_stop_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("redirect.json");
+    std::fs::write(&path,json!({"mcpServers":{"fixture":{"command":env!("CARGO_BIN_EXE_taa-mcp-forward-fixture"),"args":["good"]}}}).to_string()).unwrap();
+    let mut c = Config::default();
+    c.agent_access.user_control_mode = "view_stop".into();
+    c.agent_access.screen_resolution = "native".into();
+    c.agent_access.forward_mcp_tools = true;
+    c.forwarding.config_path = path.to_str().unwrap().into();
+    c.replay.enabled = true;
+    c.replay.save_dir = tmp.path().join("replay").to_str().unwrap().into();
+    let platform = Arc::new(MockPlatform::recording());
+    let server = Server::new(c, platform.clone());
+    let a = router(server.clone());
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+    let sid = h["mcp-session-id"].to_str().unwrap();
+    let headers = [("mcp-session-id", sid)];
+    let (_,_,body)=request(&a,"POST",json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"computer","arguments":{"action":"left_mouse_down","coordinate":[1,2]}}}),&[("mcp-session-id",sid),("x-amzn-agentaccess-computer-use-interface-id","ANTHROPIC_COMPUTER_20251124")]).await;
+    assert_eq!(value(&body)["result"]["isError"], false);
+    let (_, _, body) = request(&a, "POST", call("get_session_info", json!({})), &headers).await;
+    assert_eq!(value(&body)["result"]["isError"], false);
+    let (_,_,body)=request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"forwarded___fixture___echo","arguments":{"text":"x".repeat(70000),"password":"do-not-store"}}}),&headers).await;
+    assert_eq!(value(&body)["result"]["isError"], false);
+    assert_eq!(
+        observer_request(
+            &a,
+            "POST",
+            &format!("/observe/stop/{sid}"),
+            Some("http://localhost:8765")
+        )
+        .await
+        .0,
+        204
+    );
+    assert_eq!(
+        platform.operations.lock().unwrap().last(),
+        Some(&taa_platform::Operation::ReleaseLeft)
+    );
+    let all = replay_files(&tmp.path().join("replay"));
+    let log = all.iter().find(|p| p.ends_with("events.jsonl")).unwrap();
+    let text = std::fs::read_to_string(log).unwrap();
+    assert!(!text.contains("do-not-store"));
+    let rows: Vec<Value> = text.lines().map(value).collect();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0]["tool"], "computer");
+    assert_eq!(rows[0]["native_action"], "left_mouse_down");
+    assert!(rows[0]["frame"].is_string());
+    assert!(rows[2].get("frame").is_none());
+    assert!(rows[4].get("frame").is_none());
+    assert_eq!(rows[4]["arguments"]["truncated"], true);
+    assert_eq!(rows[5]["response"]["truncated"], true);
+    assert!(all.iter().any(|p| p.ends_with("index.html")));
+    server.shutdown().await;
+}

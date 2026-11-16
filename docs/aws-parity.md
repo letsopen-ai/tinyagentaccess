@@ -390,10 +390,12 @@ Service contract from the sample's tester [S-fwd-contract, sample tester README]
 - Screenshot storage:
   - The MCP server uploads **using the agent's credentials**, so the agent needs `s3:PutObject` [D-session].
   - Key: `agentaccess/screenshots/year=YYYY/month=MM/day=DD/{streaming-session-id}/{timestamp}.png` [D-monitor]. The docs show `.png` even for JPEG; behavior with JPEG is UNKNOWN.
+- **[TINY-PROPOSAL local mapping, M7]** UserControlMode maps to an unauthenticated same-origin `/observe` page: disabled → 404, view_only → watch, view_stop → watch + Stop closing the local MCP session through the normal release path. A new session is required after Stop. This is local screenshot polling, **not DCV**, with no streaming URL or image-builder stop/start. Keep it on loopback. No client_disconnected notification is emitted because its wire form is UNKNOWN [S-retry]. See [design M7](design.md#m7-local-replay-and-human-control).
 - User control mode [D-session]:
   - Observers watch via a streaming URL in a browser. `VIEW_STOP` shows a stop button.
   - On a stack, after a stop the agent must start a new session. On an image builder, agent access returns only after a stop/start.
   - A human opening an image builder with agent access enabled can only watch.
+- **[TINY-PROPOSAL local mapping, M7]** `[replay] enabled/save_dir` persists pre-action frames and paired before/after metadata on private local disk. Response is appended after execution because it cannot exist before dispatch (PROVISIONAL). Session closure writes a simple local `index.html`, **not a Bedrock evidence report**. No video, transcript, S3, KMS, cross-Region inference or automatic ≤15-day retention is implemented. Wait/session/forwarded calls are metadata-only; see [local choices and limits](design.md#m7-local-replay-and-human-control).
 - Replay Session [D-evidence]:
   - A whole-screen frame plus metadata (tool, arguments, response, timestamp) is captured **just before each action**.
   - After the session, Bedrock generates a video, a transcript and an HTML report, delivered to S3.

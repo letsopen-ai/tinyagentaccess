@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dialects;
+pub mod replay;
 pub mod screenshots;
 use base64::Engine;
 use config::Config;
@@ -406,6 +407,15 @@ pub async fn sequence_with_limits(
     p: Arc<dyn Platform>,
     limits: SequenceLimits,
 ) -> Value {
+    sequence_recorded(a, c, p, limits, None).await
+}
+pub async fn sequence_recorded(
+    a: &Value,
+    c: &Config,
+    p: Arc<dyn Platform>,
+    limits: SequenceLimits,
+    replay: Option<&replay::Context>,
+) -> Value {
     let empty = vec![];
     let actions = a["actions"].as_array().unwrap_or(&empty);
     let mut reason = None;
@@ -528,6 +538,15 @@ pub async fn sequence_with_limits(
         }
         let mut args = a.clone();
         args.as_object_mut().unwrap().remove("type");
+        let event = if n == "wait" {
+            if let Some(context) = replay {
+                context.begin(n, &args, c, p.clone()).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let t = Instant::now();
         let r = if n == "wait" {
             let end = t + Duration::from_secs_f64(a["duration"].as_f64().unwrap());
@@ -541,8 +560,9 @@ pub async fn sequence_with_limits(
                 result("Wait completed", false)
             }
         } else {
-            execute(n, &args, c, p.clone()).await
+            replay::execute(n, &args, c, p.clone(), replay).await
         };
+        replay::finish(event, &r).await;
         executed += 1;
         if r["isError"] == true {
             let reason = r["content"][0]["text"].as_str().unwrap_or("Action failed");

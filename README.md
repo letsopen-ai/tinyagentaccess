@@ -2,7 +2,7 @@
 
 An open-source, self-hostable, local-first Rust rebuild of the Amazon WorkSpaces for AI agents MCP server. AWS-compatible native tool names, running on your own computer, with no AWS dependency.
 
-**Pre-alpha — milestone 2:** real desktop capture and input, with local MCP transport, sessions, schemas and config. X11 is exercised end to end; macOS, Windows and Wayland need real-session validation.
+**Pre-alpha — milestone 7:** desktop capture/input, sequences, forwarding, dialect adapters, local replay and human Stop. X11 is exercised end to end; macOS, Windows and Wayland need real-session validation.
 
 **Security: no authentication yet. Binds to localhost by default. Do not expose this server to a network or the public internet.** Security: see [SECURITY.md](SECURITY.md).
 
@@ -87,3 +87,40 @@ unknown values return JSON-RPC -32602. Dialects are **best-effort, unverified vs
 all schemas are **PROVISIONAL vendor-derived, not AWS-confirmed**. Only standard
 desktop tools are replaced; session, wait, sequence and forwarded tools stay available.
 See the [local conversion choices](docs/design.md#m5-computer-use-dialect-adapters).
+
+### Local replay and human control (M7)
+
+```toml
+[replay]
+enabled = true
+save_dir = "/absolute/private/replay"
+
+[agent_access]
+user_control_mode = "view_stop" # disabled (default) | view_only | view_stop
+```
+
+Replay captures a whole-screen image immediately before each desktop action, including
+translated calls and individual sequence steps, using the configured PNG/JPEG renderer
+and default cursor setting. Responses are appended after completion. Wait, session
+metadata and forwarded calls have metadata only. Frames and append-only `events.jsonl`
+live under `agentaccess/replay/year=YYYY/month=MM/day=DD/{mcp-session-id}/`.
+Closure (tool, DELETE, idle expiry or Stop) writes an escaped local `index.html`.
+These are **TINY-PROPOSAL local artifacts, not an AWS/Bedrock evidence report**;
+there is no video, transcript, S3, KMS, or automatic retention deletion.
+Replay can contain sensitive screen/text/tool data; enable only in a private directory
+and remove it yourself. Unix creation modes are 0700/0600, Windows inherits ACLs;
+symlink sink directories and existing output files are refused. Failures warn without
+changing the tool result. Opaque metadata is capped (see [M7 choices](docs/design.md#m7-local-replay-and-human-control)).
+
+Open `http://127.0.0.1:8765/observe` on the same origin as the server. `view_only`
+shows session selection and fresh screenshots; `view_stop` also shows Stop. `disabled`
+returns 404 for observer routes. All local sessions share one desktop; selection
+chooses which session to observe or close, not a separate OS desktop. Polling uses
+the normal capture path and may require OS consent. Stop releases held input and
+closes the selected MCP session after admitted desktop work finishes. Queued calls
+then fail like calls after normal closure; the agent must create a new session.
+No `client_disconnected` notification is emitted: its AWS wire form is unknown.
+
+The observer is an **unauthenticated local substitute, not AWS DCV**. Keep the bind
+on loopback until authentication exists. Host/Origin checks and same-origin Stop
+requests reduce browser abuse; they do not authenticate local users.

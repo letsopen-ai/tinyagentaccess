@@ -1,10 +1,10 @@
 //! Streamable HTTP, without TLS or an MCP framework dependency.
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get as route_get, post},
     Json, Router,
 };
 use serde_json::{json, Value};
@@ -23,6 +23,7 @@ struct Session {
     touched: Instant,
     active: usize,
     forwarding: Option<Arc<taa_forward::ForwardingSet>>,
+    replay: Option<Arc<taa_tools::replay::Recorder>>,
 }
 #[derive(Default)]
 struct Sessions {
@@ -67,6 +68,9 @@ impl Server {
                 || v.touched.elapsed()
                     < Duration::from_secs(self.config.sessions.idle_timeout_secs);
             if !keep {
+                if let Some(replay) = v.replay.clone() {
+                    end_replay(replay);
+                }
                 teardown_later(v.forwarding.clone());
                 let desktop = self.desktop.clone();
                 let held = self.held.clone();
@@ -96,6 +100,12 @@ impl Server {
         s.open.insert(
             id.clone(),
             Session {
+                replay: self.config.replay.enabled.then(|| {
+                    taa_tools::replay::Recorder::new(
+                        self.config.replay.save_dir.clone(),
+                        id.clone(),
+                    )
+                }),
                 version: version.into(),
                 touched: Instant::now(),
                 active: 0,
@@ -133,19 +143,35 @@ impl Server {
             .and_then(|v| v.forwarding.clone())
     }
     pub async fn shutdown(&self) {
-        let sets: Vec<_> = self
+        let sessions: Vec<_> = self.sessions.lock().unwrap().open.drain().collect();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut replays = vec![];
+        for (_, session) in sessions {
+            if let Some(replay) = session.replay {
+                replays.push(replay);
+            }
+            if let Some(set) = session.forwarding {
+                tasks.spawn(async move { set.teardown().await });
+            }
+        }
+        while tasks.join_next().await.is_some() {}
+        for replay in replays {
+            let _ = tokio::task::spawn_blocking(move || replay.end()).await;
+        }
+    }
+    async fn close_released(&self, id: &str) {
+        self.release(id).await;
+        let replay = self
             .sessions
             .lock()
             .unwrap()
             .open
-            .drain()
-            .filter_map(|(_, s)| s.forwarding)
-            .collect();
-        let mut tasks = tokio::task::JoinSet::new();
-        for set in sets {
-            tasks.spawn(async move { set.teardown().await });
+            .get(id)
+            .and_then(|v| v.replay.clone());
+        self.close(id);
+        if let Some(replay) = replay {
+            let _ = tokio::task::spawn_blocking(move || replay.end()).await;
         }
-        while tasks.join_next().await.is_some() {}
     }
     fn close(&self, id: &str) {
         let mut s = self.sessions.lock().unwrap();
@@ -154,6 +180,9 @@ impl Server {
         }
         s.closed.insert(id.into(), Instant::now());
     }
+}
+fn end_replay(replay: Arc<taa_tools::replay::Recorder>) {
+    tokio::task::spawn_blocking(move || replay.end());
 }
 // PROVISIONAL (not published by AWS): teardown runs off the HTTP response path.
 fn teardown_later(set: Option<Arc<taa_forward::ForwardingSet>>) {
@@ -243,6 +272,10 @@ pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub fn router(server: Arc<Server>) -> Router {
     Router::new()
         .route("/mcp", post(handle).get(get).delete(delete))
+        .route("/observe", route_get(observe))
+        .route("/observe/sessions", route_get(observe_sessions))
+        .route("/observe/latest/{session}", route_get(observe_latest))
+        .route("/observe/stop/{session}", post(observe_stop))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(server)
 }
@@ -327,10 +360,102 @@ async fn delete(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
             .into_response();
     }
     let _desktop = s.desktop.lock().await;
-    s.release(id).await;
-    s.close(id);
+    s.close_released(id).await;
     StatusCode::NO_CONTENT.into_response()
 }
+// TINY-PROPOSAL (D-session): same-origin local polling, not DCV; no authentication.
+fn observer_allowed(s: &Server, h: &HeaderMap) -> bool {
+    security(h, &s.config)
+        && (header(h, "origin").is_empty()
+            || header(h, "origin") == format!("http://{}", header(h, "host")))
+}
+async fn observe(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
+    if !observer_allowed(&s, &h) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if s.config.agent_access.user_control_mode == "disabled" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let stop = if s.config.agent_access.user_control_mode == "view_stop" {
+        "<button id=stop>Stop selected session</button>"
+    } else {
+        ""
+    };
+    let page = include_str!("observer.html").replace("<!--STOP-->", stop);
+    ([("content-type","text/html; charset=utf-8"),("cache-control","no-store"),("x-frame-options","DENY"),("content-security-policy","default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")],page).into_response()
+}
+async fn observe_sessions(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
+    if !observer_allowed(&s, &h) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if s.config.agent_access.user_control_mode == "disabled" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut sessions = s.sessions.lock().unwrap();
+    s.cleanup(&mut sessions);
+    let mut ids: Vec<_> = sessions.open.keys().cloned().collect();
+    ids.sort();
+    (
+        [("cache-control", "no-store")],
+        Json(json!({"sessions":ids})),
+    )
+        .into_response()
+}
+async fn observe_latest(
+    State(s): State<Arc<Server>>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !observer_allowed(&s, &h) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if s.config.agent_access.user_control_mode == "disabled" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !s.config.agent_access.computer_vision {
+        return (StatusCode::FORBIDDEN, "Computer vision disabled").into_response();
+    }
+    let id = id.as_str();
+    let _desktop = s.desktop.lock().await;
+    let _active = {
+        let mut sessions = s.sessions.lock().unwrap();
+        s.cleanup(&mut sessions);
+        let Some(session) = sessions.open.get_mut(id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        session.active += 1;
+        ActiveSession(s.clone(), id.into())
+    };
+    let image = taa_tools::execute("screenshot", &json!({}), &s.config, s.platform.clone()).await;
+    ([("cache-control", "no-store")], Json(image)).into_response()
+}
+async fn observe_stop(
+    State(s): State<Arc<Server>>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !observer_allowed(&s, &h) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if s.config.agent_access.user_control_mode == "disabled" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // Require an explicit matching Origin for a state-changing browser request.
+    if s.config.agent_access.user_control_mode != "view_stop" || header(&h, "origin").is_empty() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let id = id.as_str();
+    let _desktop = s.desktop.lock().await;
+    {
+        let sessions = s.sessions.lock().unwrap();
+        if !sessions.open.contains_key(id) && !sessions.closed.contains_key(id) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    s.close_released(id).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
 fn rpc(id: &Value, r: Value) -> Response {
     Json(json!({"jsonrpc":"2.0","id":id,"result":r})).into_response()
 }
@@ -798,6 +923,32 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                 held: s.held.clone(),
                 owner: sid.clone(),
             });
+            let replay = s
+                .sessions
+                .lock()
+                .unwrap()
+                .open
+                .get(&sid)
+                .and_then(|v| v.replay.clone());
+            let context = replay.clone().map(|recorder| taa_tools::replay::Context {
+                recorder,
+                tool: name.into(),
+                arguments: args.clone(),
+            });
+            let metadata_event = if name.starts_with("forwarded___")
+                || matches!(n, "get_session_info" | "close_session")
+            {
+                let name = name.to_owned();
+                let args = args.clone();
+                tokio::task::spawn_blocking(move || {
+                    replay.and_then(|r| r.begin(&name, &args, None, None))
+                })
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
             // PROVISIONAL (not published by AWS): strip the upstream-only session
             // argument; preserve downstream result/error objects.
             let r = if name.starts_with("forwarded___") && s.config.agent_access.forward_mcp_tools {
@@ -821,7 +972,14 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                     taa_tools::screen(&s.config, platform.as_ref()),
                 ) {
                     Ok((native, translated)) if taa_tools::visible(&native, &s.config, modern) => {
-                        taa_tools::execute(&native, &translated, &s.config, platform.clone()).await
+                        taa_tools::replay::execute(
+                            &native,
+                            &translated,
+                            &s.config,
+                            platform.clone(),
+                            context.as_ref(),
+                        )
+                        .await
                     }
                     Ok(_) => client("Unknown tool"),
                     Err(e) => client(e),
@@ -847,16 +1005,32 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                     }
                     // PROVISIONAL (not published by AWS): closed text; expire_streaming_session has no local effect.
                     "close_session" => {
-                        s.release(&sid).await;
-                        s.close(&sid);
+                        s.close_released(&sid).await;
                         result("Session closed", false)
                     }
                     "execute_sequence" => {
-                        taa_tools::sequence(&args, &s.config, platform.clone()).await
+                        taa_tools::sequence_recorded(
+                            &args,
+                            &s.config,
+                            platform.clone(),
+                            taa_tools::SequenceLimits::default(),
+                            context.as_ref(),
+                        )
+                        .await
                     }
-                    _ => taa_tools::execute(n, &args, &s.config, platform.clone()).await,
+                    _ => {
+                        taa_tools::replay::execute(
+                            n,
+                            &args,
+                            &s.config,
+                            platform.clone(),
+                            context.as_ref(),
+                        )
+                        .await
+                    }
                 }
             };
+            taa_tools::replay::finish(metadata_event, &r).await;
             if !s.config.screenshots.save_dir.is_empty() {
                 let dir = s.config.screenshots.save_dir.clone();
                 let save_id = sid.clone();
