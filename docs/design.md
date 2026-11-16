@@ -326,7 +326,12 @@ Each following bullet is a separate **PROVISIONAL / TINY-PROPOSAL** local choice
   stop/start or OS logout exists. A new MCP session is required to resume.
 - **[D-session] Browser safety:** observer responses disable caching; the page denies
   framing and external resources. Existing Host/Origin checks also apply, with exact
-  Origin/Host authority matching and a required Origin for Stop. No auth is added;
+  Origin/Host authority matching and a required Origin for Stop. Only GET `/observe`
+  accepts user-initiated navigation with Sec-Fetch-Site `none` or `same-origin`;
+  Sec-Fetch-Mode and Sec-Fetch-Dest, when present, must be `navigate` and `document`.
+  The page rejects `cross-site` and `same-site` navigation and embedding. Polling,
+  session listing and Stop still require `same-origin` when Sec-Fetch-Site is present.
+  All observer routes require a loopback Host. No auth is added;
   these are browser checks, not identity. Keep the unauthenticated bind on loopback.
 - **[S-retry, D-session] Disconnect notification:** no `client_disconnected` wire
   message is emitted because its exact shape is UNKNOWN and GET/SSE is unsupported.

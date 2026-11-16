@@ -1567,6 +1567,130 @@ fn replay_files(path: &std::path::Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 #[tokio::test]
+async fn observer_browser_navigation_is_page_only() {
+    let mut c = Config::default();
+    c.agent_access.user_control_mode = "view_stop".into();
+    let a = router(Server::new(c, Arc::new(MockPlatform::recording())));
+    let (_, headers, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+    let sid = headers["mcp-session-id"].to_str().unwrap();
+    let latest = format!("/observe/latest/{sid}");
+    let stop = format!("/observe/stop/{sid}");
+    for (method, path, site, mode, dest, host, expected) in [
+        (
+            "GET",
+            "/observe",
+            "none",
+            "navigate",
+            "document",
+            "localhost:8765",
+            200,
+        ),
+        (
+            "GET",
+            "/observe",
+            "same-origin",
+            "navigate",
+            "document",
+            "localhost:8765",
+            200,
+        ),
+        (
+            "GET",
+            "/observe",
+            "cross-site",
+            "navigate",
+            "document",
+            "localhost:8765",
+            403,
+        ),
+        (
+            "GET",
+            "/observe",
+            "same-site",
+            "navigate",
+            "document",
+            "localhost:8765",
+            403,
+        ),
+        (
+            "GET",
+            "/observe",
+            "none",
+            "navigate",
+            "iframe",
+            "localhost:8765",
+            403,
+        ),
+        (
+            "GET",
+            "/observe",
+            "none",
+            "cors",
+            "document",
+            "localhost:8765",
+            403,
+        ),
+        (
+            "GET",
+            "/observe",
+            "none",
+            "navigate",
+            "document",
+            "evil.test",
+            403,
+        ),
+        (
+            "GET",
+            latest.as_str(),
+            "none",
+            "navigate",
+            "document",
+            "localhost:8765",
+            403,
+        ),
+        (
+            "GET",
+            "/observe/sessions",
+            "none",
+            "navigate",
+            "document",
+            "localhost:8765",
+            403,
+        ),
+        (
+            "POST",
+            stop.as_str(),
+            "none",
+            "navigate",
+            "document",
+            "localhost:8765",
+            403,
+        ),
+    ] {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", host)
+            .header("sec-fetch-site", site)
+            .header("sec-fetch-mode", mode)
+            .header("sec-fetch-dest", dest);
+        if method == "POST" {
+            request = request.header("origin", "http://localhost:8765");
+        }
+        let response = a
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            expected,
+            "{method} {path}: {site}/{mode}/{dest}/{host}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn observer_modes_stop_and_transport_unchanged() {
     for mode in ["disabled", "view_only", "view_stop"] {
         let mut c = Config::default();

@@ -396,15 +396,25 @@ async fn delete(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 // TINY-PROPOSAL (D-session): same-origin local polling, not DCV; no authentication.
-fn observer_allowed(s: &Server, h: &HeaderMap) -> bool {
+fn observer_origin_allowed(s: &Server, h: &HeaderMap) -> bool {
     security(h, &s.config)
         && local_host(authority_host(header(h, "host")))
-        && (!h.contains_key("sec-fetch-site") || header(h, "sec-fetch-site") == "same-origin")
         && (header(h, "origin").is_empty()
             || header(h, "origin") == format!("http://{}", header(h, "host")))
 }
+fn observer_allowed(s: &Server, h: &HeaderMap) -> bool {
+    observer_origin_allowed(s, h)
+        && (!h.contains_key("sec-fetch-site") || header(h, "sec-fetch-site") == "same-origin")
+}
+fn observer_page_allowed(s: &Server, h: &HeaderMap) -> bool {
+    observer_origin_allowed(s, h)
+        && (!h.contains_key("sec-fetch-site")
+            || matches!(header(h, "sec-fetch-site"), "none" | "same-origin"))
+        && (!h.contains_key("sec-fetch-mode") || header(h, "sec-fetch-mode") == "navigate")
+        && (!h.contains_key("sec-fetch-dest") || header(h, "sec-fetch-dest") == "document")
+}
 async fn observe(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
-    if !observer_allowed(&s, &h) {
+    if !observer_page_allowed(&s, &h) {
         return StatusCode::FORBIDDEN.into_response();
     }
     if s.config.agent_access.user_control_mode == "disabled" {
