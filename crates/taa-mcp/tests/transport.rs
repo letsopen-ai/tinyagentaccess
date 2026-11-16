@@ -1,0 +1,673 @@
+use axum::{
+    body::{to_bytes, Body},
+    http::{Request, StatusCode},
+    Router,
+};
+use serde_json::{json, Value};
+use std::sync::Arc;
+use taa_mcp::{router, Server, MODERN, STATEFUL};
+use taa_platform::MockPlatform;
+use taa_tools::config::Config;
+use tower::ServiceExt;
+fn app() -> Router {
+    router(Server::new(
+        Config::default(),
+        Arc::new(MockPlatform::default()),
+    ))
+}
+async fn request(
+    app: &Router,
+    method: &str,
+    mut body: Value,
+    headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    if headers
+        .iter()
+        .any(|(k, v)| *k == "mcp-protocol-version" && *v == MODERN)
+        && body.is_object()
+    {
+        if body.get("params").is_none() {
+            body["params"] = json!({});
+        }
+        body["params"]["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":MODERN,"io.modelcontextprotocol/clientCapabilities":{}});
+    }
+    let mut b = Request::builder()
+        .method(method)
+        .uri("/mcp")
+        .header("host", "localhost:8765")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    if headers
+        .iter()
+        .any(|(k, v)| *k == "mcp-protocol-version" && *v == MODERN)
+    {
+        if let Some(m) = body["method"].as_str() {
+            b = b.header("mcp-method", m);
+        }
+        if let Some(n) = body["params"]["name"].as_str() {
+            b = b.header("mcp-name", n);
+        }
+    }
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let r = app
+        .clone()
+        .oneshot(b.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = r.status();
+    let h = r.headers().clone();
+    let text =
+        String::from_utf8(to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    (status, h, text)
+}
+fn call(n: &str, a: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":format!("agentaccess___{n}"),"arguments":a}})
+}
+fn init(v: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":v,"capabilities":{},"clientInfo":{"name":"test","version":"1"}}})
+}
+fn value(s: &str) -> Value {
+    serde_json::from_str(s).unwrap()
+}
+#[tokio::test]
+async fn versions_and_lifecycle() {
+    for v in STATEFUL.into_iter().chain(["unsupported"]) {
+        let a = app();
+        let (status, h, b) = request(&a, "POST", init(v), &[]).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            value(&b)["result"]["protocolVersion"],
+            if v == "unsupported" { STATEFUL[2] } else { v }
+        );
+        let sid = h["mcp-session-id"].to_str().unwrap();
+        let hdr = [("mcp-session-id", sid)];
+        let (st, _, body) = request(&a, "POST", call("wait", json!({"duration":0.001})), &[]).await;
+        assert_eq!(st, 400);
+        assert_eq!(body, "Missing Mcp-Session-Id header");
+        assert_eq!(
+            request(
+                &a,
+                "POST",
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                &hdr
+            )
+            .await
+            .0,
+            202
+        );
+        assert!(
+            value(&request(&a, "POST", init(v), &[]).await.2)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("CONNECTION_LIMIT_REACHED")
+        );
+        assert_eq!(
+            value(
+                &request(&a, "POST", call("wait", json!({"duration":0.001})), &hdr)
+                    .await
+                    .2
+            )["result"]["isError"],
+            false
+        );
+        assert_eq!(request(&a, "DELETE", Value::Null, &hdr).await.0, 204);
+        assert_eq!(
+            request(&a, "POST", call("wait", json!({"duration":0.001})), &hdr)
+                .await
+                .0,
+            404
+        );
+        assert_eq!(request(&a, "DELETE", Value::Null, &hdr).await.0, 404);
+    }
+}
+#[tokio::test]
+async fn modern_lifecycle() {
+    let a = app();
+    let h = [("mcp-protocol-version", MODERN)];
+    let d = request(
+        &a,
+        "POST",
+        json!({"jsonrpc":"2.0","id":1,"method":"server/discover"}),
+        &h,
+    )
+    .await;
+    assert!(value(&d.2)["result"]["supportedVersions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(MODERN)));
+    assert!(!d.1.contains_key("mcp-session-id"));
+    let r = value(
+        &request(
+            &a,
+            "POST",
+            call("get_session_info", json!({"mcpSessionId":"NEW"})),
+            &h,
+        )
+        .await
+        .2,
+    );
+    let sid = r["result"]["mcpSessionId"].as_str().unwrap();
+    assert_eq!(
+        value(r["result"]["content"][1]["text"].as_str().unwrap())["mcpSessionId"],
+        sid
+    );
+    assert!(value(
+        &request(
+            &a,
+            "POST",
+            call("wait", json!({"mcpSessionId":"NEW","duration":0.001})),
+            &h
+        )
+        .await
+        .2
+    )["result"]["isError"]
+        .as_bool()
+        .unwrap());
+    for n in ["wait", "screenshot", "unknown"] {
+        let r = value(
+            &request(&a, "POST", call(n, json!({"mcpSessionId":sid})), &h)
+                .await
+                .2,
+        );
+        assert_eq!(r["result"]["isError"], true);
+        assert_eq!(r["result"]["mcpSessionId"], sid);
+    }
+    for _ in 0..2 {
+        let r = value(
+            &request(
+                &a,
+                "POST",
+                call(
+                    "close_session",
+                    json!({"mcpSessionId":sid,"expire_streaming_session":true}),
+                ),
+                &h,
+            )
+            .await
+            .2,
+        );
+        assert_eq!(r["result"]["isError"], false);
+        assert_eq!(r["result"]["mcpSessionId"], sid);
+    }
+    assert_eq!(
+        value(
+            &request(
+                &a,
+                "POST",
+                call("wait", json!({"mcpSessionId":"unknown","duration":0.001})),
+                &h
+            )
+            .await
+            .2
+        )["result"]["isError"],
+        true
+    );
+    assert_eq!(request(&a, "DELETE", Value::Null, &h).await.0, 405);
+}
+#[tokio::test]
+async fn interfaces_and_security() {
+    let a = app();
+    let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+    for interface in [
+        "",
+        "OPENAI_COMPUTER_V1",
+        "ANTHROPIC_COMPUTER_20250124",
+        "ANTHROPIC_COMPUTER_20251124",
+        "ANTHROPIC_COMPUTER_TOOLSET_20260801",
+        "GOOGLE_COMPUTER_USE_3X_DESKTOP_V1",
+        "bad",
+    ] {
+        let r = value(
+            &request(
+                &a,
+                "POST",
+                list.clone(),
+                &[
+                    ("mcp-protocol-version", MODERN),
+                    ("x-amzn-agentaccess-computer-use-interface-id", interface),
+                ],
+            )
+            .await
+            .2,
+        );
+        if interface.is_empty() {
+            assert!(r["result"]["tools"].is_array());
+        } else {
+            assert_eq!(
+                r["error"]["code"],
+                if interface == "bad" { -32602 } else { -32603 }
+            );
+        }
+    }
+    for origin in ["https://evil.example", "null", "http://localhost.evil"] {
+        assert_eq!(
+            request(&a, "POST", list.clone(), &[("origin", origin)])
+                .await
+                .0,
+            403
+        );
+    }
+    assert_eq!(
+        request(&a, "POST", list.clone(), &[("host", "evil.example")])
+            .await
+            .0,
+        403
+    );
+    assert_eq!(request(&a, "GET", Value::Null, &[]).await.0, 405);
+}
+#[tokio::test]
+async fn rpc_errors() {
+    let a = app();
+    for (body, code) in [
+        (json!([]), -32600),
+        (json!({"id":1,"method":"ping"}), -32600),
+        (json!({"jsonrpc":"2.0","id":1,"method":"other"}), -32601),
+    ] {
+        assert_eq!(
+            value(
+                &request(&a, "POST", body, &[("mcp-protocol-version", MODERN)])
+                    .await
+                    .2
+            )["error"]["code"],
+            code
+        );
+    }
+}
+#[tokio::test]
+async fn idle_expiry() {
+    let mut c = Config::default();
+    c.sessions.idle_timeout_secs = 1;
+    let a = router(Server::new(c, Arc::new(MockPlatform::default())));
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1010)).await;
+    assert_eq!(
+        request(
+            &a,
+            "POST",
+            call("wait", json!({"duration":0.001})),
+            &[("mcp-session-id", h["mcp-session-id"].to_str().unwrap())]
+        )
+        .await
+        .0,
+        404
+    );
+}
+
+#[tokio::test]
+async fn march_batches() {
+    let a = app();
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[0]), &[]).await;
+    let hdr = [("mcp-session-id", h["mcp-session-id"].to_str().unwrap())];
+    let r=value(&request(&a,"POST",json!([{"jsonrpc":"2.0","id":2,"method":"ping"},{"jsonrpc":"2.0","method":"notifications/initialized"},call("wait",json!({"duration":0.001}))]),&hdr).await.2);
+    assert_eq!(r.as_array().unwrap().len(), 2);
+    assert_eq!(r[1]["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn protocol_validation() {
+    let a = app();
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+    let sid = h["mcp-session-id"].to_str().unwrap();
+    assert_eq!(
+        request(
+            &a,
+            "POST",
+            call("wait", json!({"duration":0.001})),
+            &[("mcp-session-id", sid), ("mcp-protocol-version", "bad")]
+        )
+        .await
+        .0,
+        400
+    );
+    let r = value(
+        &request(
+            &a,
+            "POST",
+            json!({"jsonrpc":"2.0","id":1,"method":"server/discover"}),
+            &[("mcp-protocol-version", "2099-01-01")],
+        )
+        .await
+        .2,
+    );
+    assert_eq!(r["error"]["code"], -32022);
+    assert_eq!(r["error"]["data"]["supported"], json!([MODERN]));
+    assert_eq!(
+        request(
+            &a,
+            "POST",
+            json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+            &[
+                ("mcp-protocol-version", STATEFUL[0]),
+                ("mcp-session-id", sid)
+            ]
+        )
+        .await
+        .0,
+        400
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .body(Body::from("{"))
+        .unwrap();
+    let r = a.oneshot(req).await.unwrap();
+    assert_eq!(
+        value(std::str::from_utf8(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap())
+            ["error"]["code"],
+        -32700
+    );
+}
+
+#[tokio::test]
+async fn gated_calls_are_unknown() {
+    let mut c = Config::default();
+    c.agent_access.computer_input = false;
+    c.agent_access.computer_vision = false;
+    let a = router(Server::new(c, Arc::new(MockPlatform::recording())));
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+    for n in ["screenshot", "key", "execute_sequence", "close_session"] {
+        let r = value(
+            &request(
+                &a,
+                "POST",
+                call(n, json!({})),
+                &[("mcp-session-id", h["mcp-session-id"].to_str().unwrap())],
+            )
+            .await
+            .2,
+        );
+        assert_eq!(
+            r["result"]["content"][0]["text"],
+            "CLIENT_ERROR: Unknown tool"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rpc_errors_preserve_desktop_id() {
+    let a = app();
+    let h = [("mcp-protocol-version", MODERN)];
+    let r = value(
+        &request(
+            &a,
+            "POST",
+            call("get_session_info", json!({"mcpSessionId":"NEW"})),
+            &h,
+        )
+        .await
+        .2,
+    );
+    let sid = r["result"]["mcpSessionId"].as_str().unwrap();
+    let r = value(
+        &request(
+            &a,
+            "POST",
+            call("wait", json!({"mcpSessionId":sid,"duration":0.001})),
+            &[
+                ("mcp-protocol-version", MODERN),
+                ("x-amzn-agentaccess-computer-use-interface-id", "bad"),
+            ],
+        )
+        .await
+        .2,
+    );
+    assert_eq!(r["error"]["code"], -32602);
+    assert_eq!(r["error"]["data"]["mcpSessionId"], sid);
+}
+
+// Raw requests deliberately bypass the happy-path helper's metadata/header injection.
+async fn raw(a: &Router, body: impl Into<Body>, headers: &[(&str, &str)]) -> (StatusCode, Value) {
+    let mut b = Request::builder().method("POST").uri("/mcp");
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let r = a
+        .clone()
+        .oneshot(b.body(body.into()).unwrap())
+        .await
+        .unwrap();
+    let status = r.status();
+    let bytes = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+const BASE: &[(&str, &str)] = &[
+    ("host", "localhost"),
+    ("content-type", "application/json"),
+    ("accept", "application/json"),
+];
+
+#[tokio::test]
+async fn modern_statuses_and_envelopes() {
+    let a = app();
+    let mut h = BASE.to_vec();
+    h.push(("mcp-protocol-version", MODERN));
+    for (body, code) in [
+        ("{", -32700),
+        (r#"{"jsonrpc":"2.0","id":{},"method":"ping"}"#, -32600),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}"#,
+            -32602,
+        ),
+        (r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#, -32602),
+    ] {
+        let (st, v) = raw(&a, body, &h).await;
+        assert_eq!(st, 400);
+        assert_eq!(v["error"]["code"], code);
+        if code == -32600 {
+            assert!(v["id"].is_null());
+        }
+    }
+    let (st, _, b) = request(
+        &a,
+        "POST",
+        json!({"jsonrpc":"2.0","id":1,"method":"unknown"}),
+        &[("mcp-protocol-version", MODERN)],
+    )
+    .await;
+    assert_eq!(st, 404);
+    assert_eq!(value(&b)["error"]["code"], -32601);
+    for method in ["ping", "tools/call", "tools/list", "server/discover"] {
+        let (st, _, b) = request(
+            &a,
+            "POST",
+            json!({"jsonrpc":"2.0","id":1,"method":method}),
+            &[("mcp-protocol-version", "2099-01-01")],
+        )
+        .await;
+        assert_eq!(st, 400);
+        assert_eq!(value(&b)["error"]["code"], -32022);
+        assert_eq!(value(&b)["error"]["data"]["requested"], "2099-01-01");
+    }
+    let (st, v) = raw(
+        &a,
+        r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#,
+        &h,
+    )
+    .await;
+    assert_eq!(st, 202);
+    assert!(v.is_null());
+    assert_eq!(
+        request(
+            &a,
+            "POST",
+            json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+            &[("mcp-protocol-version", MODERN)]
+        )
+        .await
+        .0,
+        200
+    );
+}
+
+#[tokio::test]
+async fn bounded_bodies_and_batches() {
+    let a = app();
+    assert_eq!(
+        raw(&a, " ".repeat(taa_mcp::MAX_BODY_BYTES + 1), BASE)
+            .await
+            .0,
+        413
+    );
+    let nested = format!("{}{}", "[".repeat(200000), "]".repeat(200000));
+    let (st, v) = raw(&a, nested, BASE).await;
+    assert_eq!(st, 400);
+    assert_eq!(v["error"]["code"], -32700);
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[0]), &[]).await;
+    let (_,_,b) = request(&a,"POST",json!([[{"jsonrpc":"2.0","id":1,"method":"ping"}],42,{"jsonrpc":"2.0","id":2,"method":"ping"}]),&[("mcp-session-id",h["mcp-session-id"].to_str().unwrap())]).await;
+    let v = value(&b);
+    assert_eq!(v[0]["error"]["code"], -32600);
+    assert_eq!(v[1]["error"]["code"], -32600);
+    assert_eq!(v[2]["result"], json!({}));
+}
+
+#[tokio::test]
+async fn media_and_untrusted_headers() {
+    let a = app();
+    let body = init(STATEFUL[2]).to_string();
+    for (key, val, status) in [
+        ("host", "evil.example", 403),
+        ("origin", "http://localhost", 403),
+        ("content-type", "text/plain", 400),
+        ("mcp-method", "ping", 400),
+    ] {
+        let mut h = BASE.to_vec();
+        if key == "origin" {
+            h.push((key, val));
+            h.push((key, val));
+        } else {
+            h.push((key, val));
+            if key == "mcp-method" {
+                h.push((key, val));
+            }
+        }
+        assert_eq!(raw(&a, body.clone(), &h).await.0, status);
+    }
+    for (h, st) in [
+        (
+            vec![("host", "localhost"), ("accept", "application/json")],
+            415,
+        ),
+        (
+            vec![
+                ("host", "localhost"),
+                ("content-type", "text/plain"),
+                ("accept", "application/json"),
+            ],
+            415,
+        ),
+        (
+            vec![("host", "localhost"), ("content-type", "application/json")],
+            406,
+        ),
+        (
+            vec![
+                ("host", "localhost"),
+                ("content-type", "application/json"),
+                ("accept", "text/event-stream"),
+            ],
+            406,
+        ),
+    ] {
+        assert_eq!(raw(&a, body.clone(), &h).await.0, st);
+    }
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "*/*")
+        .header(
+            "mcp-method",
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    assert_eq!(a.oneshot(req).await.unwrap().status(), 400);
+}
+
+#[tokio::test]
+async fn concrete_bind_security() {
+    let c = Config {
+        bind: "192.0.2.10:8765".into(),
+        ..Config::default()
+    };
+    c.validate().unwrap();
+    let a = router(Server::new(c, Arc::new(MockPlatform::default())));
+    let h = [
+        ("host", "192.0.2.10:8765"),
+        ("content-type", "application/json"),
+        ("accept", "application/json"),
+    ];
+    assert_eq!(raw(&a, init(STATEFUL[2]).to_string(), &h).await.0, 200);
+    let h = [
+        ("host", "192.0.2.11:8765"),
+        ("content-type", "application/json"),
+        ("accept", "application/json"),
+    ];
+    assert_eq!(raw(&a, init(STATEFUL[2]).to_string(), &h).await.0, 403);
+    for bind in ["0.0.0.0:8765", "[::]:8765"] {
+        let c = Config {
+            bind: bind.into(),
+            ..Config::default()
+        };
+        assert!(c.validate().unwrap_err().contains("NO AUTHENTICATION"));
+    }
+}
+
+#[tokio::test]
+async fn request_ids_params_and_legacy_handler_status() {
+    let a = app();
+    let mut h = BASE.to_vec();
+    h.push(("mcp-protocol-version", MODERN));
+    for id in [Value::Null, json!(true), json!(1.5), json!([]), json!({})] {
+        let (st, v) = raw(
+            &a,
+            json!({"jsonrpc":"2.0","id":id,"method":"ping"}).to_string(),
+            &h,
+        )
+        .await;
+        assert_eq!(st, 400);
+        assert_eq!(v["error"]["code"], -32600);
+        assert!(v["id"].is_null());
+    }
+    for params in [Value::Null, json!(42), json!("bad"), json!([])] {
+        let (st, v) = raw(
+            &a,
+            json!({"jsonrpc":"2.0","id":1,"method":"ping","params":params}).to_string(),
+            &h,
+        )
+        .await;
+        assert_eq!(st, 400);
+        assert_eq!(v["error"]["code"], -32602);
+    }
+    let (_, headers, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+    let (st, _, b) = request(
+        &a,
+        "POST",
+        json!({"jsonrpc":"2.0","id":1,"method":"unknown"}),
+        &[(
+            "mcp-session-id",
+            headers["mcp-session-id"].to_str().unwrap(),
+        )],
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(value(&b)["error"]["code"], -32601);
+    h.push(("mcp-method", "ping"));
+    h.push(("mcp-method", "ping"));
+    let (st, v) = raw(
+        &a,
+        json!({"jsonrpc":"2.0","id":1,"method":"ping"}).to_string(),
+        &h,
+    )
+    .await;
+    assert_eq!(st, 400);
+    assert_eq!(v["error"]["code"], -32020);
+}

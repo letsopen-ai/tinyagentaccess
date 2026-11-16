@@ -1,0 +1,14 @@
+[package]
+name = "tinyagentaccess"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio .workspace = true
+axum .workspace = true
+toml .workspace = true
+taa-tools .workspace = true
+taa-mcp .workspace = true
+taa-platform .workspace = true
