@@ -11,3 +11,5 @@ max_sessions = 1
 idle_timeout_secs = 780
 [screenshots]
 save_dir = "" # local disk placeholder; milestone 7
+[platform]
+linux_backend = "auto" # auto | wayland | x11; auto prefers Wayland, never XWayland

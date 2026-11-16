@@ -1,33 +1,119 @@
-//! Desktop boundary; real OS implementations arrive in milestone 2.
-use serde_json::Value;
-use std::sync::Mutex;
-#[derive(Debug, Clone)]
-pub struct Screenshot {
-    pub bytes: Vec<u8>,
-    pub mime_type: String,
-    pub width: u32,
-    pub height: u32,
+//! Typed, blocking desktop boundary. All positions are primary-display physical pixels.
+mod input;
+pub mod keys;
+#[cfg(target_os = "macos")]
+mod macos;
+pub mod pixels;
+#[cfg(target_os = "linux")]
+mod wayland;
+#[cfg(windows)]
+mod windows;
+#[cfg(target_os = "linux")]
+pub mod x11;
+pub use keys::{Key, KeyCombo};
+pub use pixels::{Frame, Point};
+use serde_json::{json, Value};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    Left,
+    Middle,
+    Right,
 }
-/// Object-safe desktop operations. Coordinates use the agent-visible screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum Operation {
+    Move(Point),
+    Click(Point, Button, u8, KeyCombo),
+    Button(Point, bool, KeyCombo),
+    Drag(Point, Point),
+    Scroll(Point, ScrollDirection, i64, KeyCombo),
+    Key(KeyCombo, Duration),
+    Text(String),
+}
+/// Implementations serialize their native connection internally; callers also serialize dispatch.
 pub trait Platform: Send + Sync {
     fn name(&self) -> &str;
+    /// Cached physical dimensions; must never prompt or wait for consent.
     fn screen_size(&self) -> (u32, u32);
-    fn screenshot(&self, include_cursor: bool) -> Result<Screenshot, String>;
-    fn mouse_move(&self, args: &Value) -> Result<(), String>;
-    fn click(&self, button: &str, count: u8, args: &Value) -> Result<(), String>;
-    fn mouse_down(&self, args: &Value) -> Result<(), String>;
-    fn mouse_up(&self, args: &Value) -> Result<(), String>;
-    fn drag(&self, args: &Value) -> Result<(), String>;
-    fn scroll(&self, args: &Value) -> Result<(), String>;
-    fn key(&self, combo: &str) -> Result<(), String>;
-    fn hold_key(&self, combo: &str, duration: f64) -> Result<(), String>;
-    fn type_text(&self, text: &str) -> Result<(), String>;
+    fn capture(&self) -> Result<Frame, String>;
+    fn capture_geometry(&self) -> Result<(u32, u32), String> {
+        Ok(self.screen_size())
+    }
+    fn perform(&self, op: Operation) -> Result<(), String>;
+}
+pub fn notches(ticks: i64) -> u32 {
+    ((ticks.max(1) as u64 + 60) / 120)
+        .max(1)
+        .min(u32::MAX as u64) as u32
+}
+pub fn detect(linux_backend: &str) -> Arc<dyn Platform> {
+    let _ = linux_backend;
+    #[cfg(target_os = "linux")]
+    {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var("XDG_SESSION_TYPE").is_ok_and(|s| s == "wayland");
+        if linux_backend == "wayland" || (linux_backend == "auto" && wayland) {
+            return Arc::new(wayland::Wayland::default());
+        }
+        if linux_backend == "x11" || std::env::var_os("DISPLAY").is_some() {
+            return Arc::new(
+                std::env::var("DISPLAY")
+                    .ok()
+                    .and_then(|d| x11::X11::connect(&d).ok())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Arc::new(macos::Mac::new());
+    }
+    #[cfg(windows)]
+    {
+        return Arc::new(windows::Windows::new());
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = linux_backend;
+        Arc::new(NoDisplay)
+    }
+}
+struct NoDisplay;
+impl Platform for NoDisplay {
+    fn name(&self) -> &str {
+        "unavailable"
+    }
+    fn screen_size(&self) -> (u32, u32) {
+        (1280, 720)
+    }
+    fn capture(&self) -> Result<Frame, String> {
+        if cfg!(target_os = "linux") {
+            Err("no graphical session: DISPLAY/WAYLAND_DISPLAY not set; run inside a desktop session".into())
+        } else {
+            Err("desktop backend not available on this platform yet".into())
+        }
+    }
+    fn perform(&self, _: Operation) -> Result<(), String> {
+        self.capture().map(|_| ())
+    }
 }
 #[derive(Default)]
 pub struct MockPlatform {
     pub calls: Mutex<Vec<(String, Value)>>,
+    pub operations: Mutex<Vec<Operation>>,
     pub available: bool,
 }
+pub type UnavailablePlatform = MockPlatform;
 impl MockPlatform {
     pub fn recording() -> Self {
         Self {
@@ -35,15 +121,14 @@ impl MockPlatform {
             ..Self::default()
         }
     }
-    fn record(&self, name: &str, args: Value) -> Result<(), String> {
+    fn record(&self, n: String, v: Value) -> Result<(), String> {
         if !self.available {
             return Err("desktop backend not available on this platform yet".into());
         }
-        self.calls.lock().unwrap().push((name.into(), args));
+        self.calls.lock().unwrap().push((n, v));
         Ok(())
     }
 }
-pub type UnavailablePlatform = MockPlatform;
 impl Platform for MockPlatform {
     fn name(&self) -> &str {
         if self.available {
@@ -53,45 +138,41 @@ impl Platform for MockPlatform {
         }
     }
     fn screen_size(&self) -> (u32, u32) {
-        (1280, 720)
+        (1920, 1080)
     }
-    fn screenshot(&self, include_cursor: bool) -> Result<Screenshot, String> {
-        self.record(
-            "screenshot",
-            serde_json::json!({"include_cursor":include_cursor}),
-        )?;
-        Ok(Screenshot {
-            bytes: vec![],
-            mime_type: "image/png".into(),
-            width: 1280,
-            height: 720,
-        })
+    fn capture(&self) -> Result<Frame, String> {
+        self.record("screenshot".into(), json!({}))?;
+        Ok(Frame::solid(1920, 1080, [40, 80, 120, 255]))
     }
-    fn mouse_move(&self, a: &Value) -> Result<(), String> {
-        self.record("move_pointer", a.clone())
+    fn perform(&self, op: Operation) -> Result<(), String> {
+        let name = match &op {
+            Operation::Move(_) => "move_pointer".into(),
+            Operation::Click(_, b, n, _) => format!(
+                "click:{}:{n}",
+                match b {
+                    Button::Left => "left",
+                    Button::Middle => "middle",
+                    Button::Right => "right",
+                }
+            ),
+            Operation::Button(_, true, _) => "left_mouse_down".into(),
+            Operation::Button(_, false, _) => "left_mouse_up".into(),
+            Operation::Drag(..) => "left_click_drag".into(),
+            Operation::Scroll(..) => "scroll".into(),
+            Operation::Key(_, d) => if d.is_zero() { "key" } else { "hold_key" }.into(),
+            Operation::Text(_) => "type_text".into(),
+        };
+        self.record(name, json!({}))?;
+        self.operations.lock().unwrap().push(op);
+        Ok(())
     }
-    fn click(&self, b: &str, c: u8, a: &Value) -> Result<(), String> {
-        self.record(&format!("click:{b}:{c}"), a.clone())
-    }
-    fn mouse_down(&self, a: &Value) -> Result<(), String> {
-        self.record("left_mouse_down", a.clone())
-    }
-    fn mouse_up(&self, a: &Value) -> Result<(), String> {
-        self.record("left_mouse_up", a.clone())
-    }
-    fn drag(&self, a: &Value) -> Result<(), String> {
-        self.record("left_click_drag", a.clone())
-    }
-    fn scroll(&self, a: &Value) -> Result<(), String> {
-        self.record("scroll", a.clone())
-    }
-    fn key(&self, s: &str) -> Result<(), String> {
-        self.record("key", s.into())
-    }
-    fn hold_key(&self, s: &str, d: f64) -> Result<(), String> {
-        self.record("hold_key", serde_json::json!({"keys":s,"duration":d}))
-    }
-    fn type_text(&self, s: &str) -> Result<(), String> {
-        self.record("type_text", s.into())
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ticks() {
+        for (t, n) in [(1, 1), (60, 1), (120, 1), (179, 1), (180, 2), (360, 3)] {
+            assert_eq!(super::notches(t), n);
+        }
     }
 }

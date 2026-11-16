@@ -6,6 +6,7 @@ pub struct Config {
     pub agent_access: AgentAccess,
     pub sessions: Sessions,
     pub screenshots: Screenshots,
+    pub platform: PlatformConfig,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -35,6 +36,7 @@ impl Default for Config {
             agent_access: AgentAccess::default(),
             sessions: Sessions::default(),
             screenshots: Screenshots::default(),
+            platform: PlatformConfig::default(),
         }
     }
 }
@@ -84,9 +86,25 @@ impl Config {
         {
             return Err("invalid agent_access enum value".into());
         }
+        if !["auto", "wayland", "x11"].contains(&self.platform.linux_backend.as_str()) {
+            return Err("invalid platform.linux_backend".into());
+        }
         if self.sessions.max_sessions == 0 || self.sessions.idle_timeout_secs == 0 {
             return Err("session limits must be positive".into());
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlatformConfig {
+    pub linux_backend: String,
+}
+impl Default for PlatformConfig {
+    fn default() -> Self {
+        Self {
+            linux_backend: "auto".into(),
+        }
     }
 }

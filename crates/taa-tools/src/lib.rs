@@ -2,8 +2,12 @@ pub mod config;
 use base64::Engine;
 use config::Config;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use taa_platform::Platform;
+use taa_platform::{
+    pixels::{Mapping, Point},
+    Button, Operation, Platform, ScrollDirection,
+};
 pub const PREFIX: &str = "agentaccess___";
 pub const NAMES: &[&str] = &[
     "left_click",
@@ -184,11 +188,23 @@ pub fn validate(n: &str, a: &Value, screen: (u32, u32)) -> Result<(), String> {
             "x" | "start_x" | "end_x" | "y" | "start_y" | "end_y"
         ) {
             let bound = if k.ends_with('x') { screen.0 } else { screen.1 };
+            if bound == 0 {
+                return Err(
+                    "native screen size unknown; take a screenshot before using native coordinates"
+                        .into(),
+                );
+            }
             let x = v.as_i64().unwrap();
             if x < 0 || x >= bound as i64 {
                 return Err(format!("{k} outside screen bounds"));
             }
         }
+    }
+    if let Some(keys) = a["keys"].as_str() {
+        taa_platform::keys::combo(keys, false)?;
+    }
+    if let Some(keys) = a["modifiers"].as_str() {
+        taa_platform::keys::combo(keys, true)?;
     }
     Ok(())
 }
@@ -199,51 +215,111 @@ pub fn screen(c: &Config, p: &dyn Platform) -> (u32, u32) {
         (1280, 720)
     }
 }
-pub async fn execute(n: &str, a: &Value, c: &Config, p: &dyn Platform) -> Value {
-    if let Err(e) = validate(n, a, screen(c, p)) {
+pub async fn execute(n: &str, a: &Value, c: &Config, p: Arc<dyn Platform>) -> Value {
+    if let Err(e) = validate(n, a, screen(c, p.as_ref())) {
         return client(e);
     }
     if n == "wait" {
         tokio::time::sleep(Duration::from_secs_f64(a["duration"].as_f64().unwrap())).await;
         return result("Wait completed", false);
     }
-    let outcome = match n {
-        "screenshot" => {
-            return match p.screenshot(a["include_cursor"].as_bool().unwrap_or(false)) {
-                Ok(s) => {
-                    json!({"content":[{"type":"image","data":base64::engine::general_purpose::STANDARD.encode(s.bytes),"mimeType":s.mime_type}],"isError":false})
-                }
-                Err(e) => result(format!("SERVER_ERROR: {e}"), true),
+    let n = n.to_owned();
+    let a = a.clone();
+    let c = c.clone();
+    match tokio::task::spawn_blocking(move || execute_blocking(&n, &a, &c, p.as_ref())).await {
+        Ok(v) => v,
+        Err(e) => result(format!("SERVER_ERROR: desktop worker failed: {e}"), true),
+    }
+}
+fn execute_blocking(n: &str, a: &Value, c: &Config, p: &dyn Platform) -> Value {
+    let native = c.agent_access.screen_resolution == "native";
+    if n == "screenshot" {
+        let outcome = p
+            .capture()
+            .and_then(|f| {
+                taa_platform::pixels::render(
+                    f,
+                    native,
+                    a["include_cursor"].as_bool().unwrap_or(false),
+                )
+            })
+            .and_then(|f| {
+                taa_platform::pixels::encode(&f, c.agent_access.screen_image_format == "jpeg")
+            });
+        return match outcome {
+            Ok((bytes, mime)) => {
+                json!({"content":[{"type":"image","data":base64::engine::general_purpose::STANDARD.encode(bytes),"mimeType":mime}],"isError":false})
             }
+            Err(e) => result(format!("SERVER_ERROR: {e}"), true),
+        };
+    }
+    // Only pointer actions need geometry; keyboard input must not initiate Screenshot consent.
+    let geometry = if matches!(n, "key" | "hold_key" | "type_text") {
+        Ok(p.screen_size())
+    } else {
+        p.capture_geometry()
+    };
+    let f = match geometry {
+        Ok(s) => s,
+        Err(e) => return result(format!("SERVER_ERROR: {e}"), true),
+    };
+    if let Err(e) = validate(n, a, if native { f } else { (1280, 720) }) {
+        return client(e);
+    }
+    let m = Mapping::new(f, native);
+    let point = |x: &str, y: &str| {
+        m.inverse(Point {
+            x: a[x].as_i64().unwrap() as i32,
+            y: a[y].as_i64().unwrap() as i32,
+        })
+    };
+    let mods = taa_platform::keys::combo(a["modifiers"].as_str().unwrap_or(""), true).unwrap();
+    let op = match n {
+        "move_pointer" => Operation::Move(point("x", "y")),
+        "left_mouse_down" | "left_mouse_up" => {
+            Operation::Button(point("x", "y"), n == "left_mouse_down", mods)
         }
-        "move_pointer" => p.mouse_move(a),
-        "left_mouse_down" => p.mouse_down(a),
-        "left_mouse_up" => p.mouse_up(a),
-        "left_click_drag" => p.drag(a),
-        "scroll" => p.scroll(a),
-        "key" => p.key(a["keys"].as_str().unwrap()),
-        "hold_key" => p.hold_key(a["keys"].as_str().unwrap(), a["duration"].as_f64().unwrap()),
-        "type_text" => p.type_text(a["text"].as_str().unwrap()),
-        "left_click" | "double_click" | "triple_click" | "right_click" | "middle_click" => p.click(
-            match n {
-                "right_click" => "right",
-                "middle_click" => "middle",
-                _ => "left",
+        "left_click_drag" => Operation::Drag(point("start_x", "start_y"), point("end_x", "end_y")),
+        "scroll" => Operation::Scroll(
+            point("x", "y"),
+            match a["scroll_direction"].as_str().unwrap() {
+                "Up" => ScrollDirection::Up,
+                "Down" => ScrollDirection::Down,
+                "Left" => ScrollDirection::Left,
+                _ => ScrollDirection::Right,
             },
-            match n {
-                "double_click" => 2,
-                "triple_click" => 3,
-                _ => 1,
-            },
-            a,
+            a["scroll_amount"].as_i64().unwrap(),
+            mods,
         ),
+        "key" | "hold_key" => Operation::Key(
+            taa_platform::keys::combo(a["keys"].as_str().unwrap(), false).unwrap(),
+            Duration::from_secs_f64(a["duration"].as_f64().unwrap_or(0.)),
+        ),
+        "type_text" => Operation::Text(a["text"].as_str().unwrap().into()),
+        "left_click" | "double_click" | "triple_click" | "right_click" | "middle_click" => {
+            Operation::Click(
+                point("x", "y"),
+                match n {
+                    "right_click" => Button::Right,
+                    "middle_click" => Button::Middle,
+                    _ => Button::Left,
+                },
+                match n {
+                    "double_click" => 2,
+                    "triple_click" => 3,
+                    _ => 1,
+                },
+                mods,
+            )
+        }
         _ => return client("Unknown tool"),
     };
-    match outcome {
+    match p.perform(op) {
         Ok(()) => result("Action completed", false),
         Err(e) => result(format!("SERVER_ERROR: {e}"), true),
     }
 }
+
 fn short(a: &Value) -> &str {
     a["type"]
         .as_str()
@@ -251,7 +327,7 @@ fn short(a: &Value) -> &str {
         .strip_prefix(PREFIX)
         .unwrap_or(a["type"].as_str().unwrap_or(""))
 }
-pub async fn sequence(a: &Value, c: &Config, p: &dyn Platform) -> Value {
+pub async fn sequence(a: &Value, c: &Config, p: Arc<dyn Platform>) -> Value {
     let Some(actions) = a["actions"].as_array() else {
         return client("actions must be an array");
     };
@@ -281,7 +357,7 @@ pub async fn sequence(a: &Value, c: &Config, p: &dyn Platform) -> Value {
         {
             Err("action cannot be nested or is unavailable".into())
         } else {
-            validate(n, &args, screen(c, p))
+            validate(n, &args, screen(c, p.as_ref()))
         };
         if let Err(e) = e {
             reason = Some(format!("action {i}: {e}"));
@@ -323,7 +399,7 @@ pub async fn sequence(a: &Value, c: &Config, p: &dyn Platform) -> Value {
         let mut args = a.clone();
         args.as_object_mut().unwrap().remove("type");
         let t = Instant::now();
-        let r = execute(n, &args, c, p).await;
+        let r = execute(n, &args, c, p.clone()).await;
         executed += 1;
         failed = r["isError"] == true;
         if !failed {
@@ -334,7 +410,7 @@ pub async fn sequence(a: &Value, c: &Config, p: &dyn Platform) -> Value {
     let mut contents = vec![];
     let mut terminal = json!({"status":"skipped"});
     if !failed {
-        let r = execute("screenshot", &json!({}), c, p).await;
+        let r = execute("screenshot", &json!({}), c, p.clone()).await;
         failed = r["isError"] == true;
         terminal = json!({"status":if failed{"failed"}else{"success"}});
         if !failed {

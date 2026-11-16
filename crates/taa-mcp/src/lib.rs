@@ -586,16 +586,20 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                 match n {
                     "get_session_info" => {
                         let (w, height) = taa_tools::screen(&s.config, s.platform.as_ref());
-                        result(json!({"mcpSessionId":sid,"hostname":std::env::var("HOSTNAME").or_else(|_|std::env::var("COMPUTERNAME")).unwrap_or_else(|_|"localhost".into()),"os":std::env::consts::OS,"platformBackend":s.platform.name(),"screen":{"width":w,"height":height},"protocolVersion":actual_version,"serverVersion":env!("CARGO_PKG_VERSION")}).to_string(),false)
+                        if w == 0 || height == 0 {
+                            result("SERVER_ERROR: native screen size unknown; take a screenshot to authorize capture and discover display dimensions",true)
+                        } else {
+                            result(json!({"mcpSessionId":sid,"hostname":std::env::var("HOSTNAME").or_else(|_|std::env::var("COMPUTERNAME")).unwrap_or_else(|_|"localhost".into()),"os":std::env::consts::OS,"platformBackend":s.platform.name(),"screen":{"width":w,"height":height},"protocolVersion":actual_version,"serverVersion":env!("CARGO_PKG_VERSION")}).to_string(),false)
+                        }
                     }
                     "close_session" => {
                         s.close(&sid);
                         result("Session closed", false)
                     }
                     "execute_sequence" => {
-                        taa_tools::sequence(&args, &s.config, s.platform.as_ref()).await
+                        taa_tools::sequence(&args, &s.config, s.platform.clone()).await
                     }
-                    _ => taa_tools::execute(n, &args, &s.config, s.platform.as_ref()).await,
+                    _ => taa_tools::execute(n, &args, &s.config, s.platform.clone()).await,
                 }
             };
             drop(active);

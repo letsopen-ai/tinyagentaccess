@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::sync::Arc;
 use taa_platform::MockPlatform;
 use taa_tools::{config::Config, *};
 #[test]
@@ -54,7 +55,7 @@ fn catalogs() {
 #[tokio::test]
 async fn waits() {
     let c = Config::default();
-    let p = MockPlatform::default();
+    let p = Arc::new(MockPlatform::default());
     for d in [
         json!(0),
         json!(0.0005),
@@ -62,17 +63,20 @@ async fn waits() {
         json!("1"),
         Value::Null,
     ] {
-        let r = execute("wait", &json!({"duration":d}), &c, &p).await;
+        let r = execute("wait", &json!({"duration":d}), &c, p.clone()).await;
         assert_eq!(r["isError"], true);
         assert!(r["content"][0]["text"]
             .as_str()
             .unwrap()
             .starts_with("CLIENT_ERROR:"));
     }
-    assert_eq!(execute("wait", &json!({}), &c, &p).await["isError"], true);
+    assert_eq!(
+        execute("wait", &json!({}), &c, p.clone()).await["isError"],
+        true
+    );
     for d in [0.001, 0.002] {
         assert_eq!(
-            execute("wait", &json!({"duration":d}), &c, &p).await["isError"],
+            execute("wait", &json!({"duration":d}), &c, p.clone()).await["isError"],
             false
         );
     }
@@ -80,7 +84,7 @@ async fn waits() {
 #[tokio::test]
 async fn routing_and_bounds() {
     let c = Config::default();
-    let p = MockPlatform::recording();
+    let p = Arc::new(MockPlatform::recording());
     for (n, a) in [
         ("left_click", json!({"x":1,"y":2,"modifiers":"ctrl"})),
         (
@@ -95,21 +99,27 @@ async fn routing_and_bounds() {
         ("hold_key", json!({"keys":"shift","duration":1})),
         ("type_text", json!({"text":"hello"})),
     ] {
-        assert_eq!(execute(n, &a, &c, &p).await["isError"], false);
+        assert_eq!(execute(n, &a, &c, p.clone()).await["isError"], false);
     }
     assert_eq!(p.calls.lock().unwrap().len(), 6);
     assert_eq!(p.calls.lock().unwrap()[0].0, "click:left:1");
     assert!(validate("move_pointer", &json!({"x":1280,"y":0}), (1280, 720)).is_err());
     assert!(validate("move_pointer", &json!({"x":1.5,"y":0}), (1280, 720)).is_err());
     assert_eq!(
-        execute("screenshot", &json!({}), &c, &MockPlatform::default()).await["content"][0]["text"],
+        execute(
+            "screenshot",
+            &json!({}),
+            &c,
+            Arc::new(MockPlatform::default())
+        )
+        .await["content"][0]["text"],
         "SERVER_ERROR: desktop backend not available on this platform yet"
     );
 }
 #[tokio::test]
 async fn rejections() {
     let c = Config::default();
-    let p = MockPlatform::recording();
+    let p = Arc::new(MockPlatform::recording());
     for (actions, expected) in [
         (
             vec![json!({"type":"key","keys":"a"}); 21],
@@ -132,7 +142,7 @@ async fn rejections() {
             "action 0: action cannot be nested or is unavailable".into(),
         ),
     ] {
-        let r = sequence(&json!({"actions":actions}), &c, &p).await;
+        let r = sequence(&json!({"actions":actions}), &c, p.clone()).await;
         assert_eq!(r["isError"], true);
         let body: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(body["sequence_summary"]["stop_reason"], expected);
@@ -147,8 +157,8 @@ async fn rejections() {
 #[tokio::test]
 async fn sequence_dispatch() {
     let c = Config::default();
-    let p = MockPlatform::recording();
-    let r=sequence(&json!({"actions":[{"type":"agentaccess___key","keys":"Return"},{"type":"wait","duration":0.001}]}),&c,&p).await;
+    let p = Arc::new(MockPlatform::recording());
+    let r=sequence(&json!({"actions":[{"type":"agentaccess___key","keys":"Return"},{"type":"wait","duration":0.001}]}),&c,p.clone()).await;
     assert_eq!(r["isError"], false);
     assert_eq!(p.calls.lock().unwrap().len(), 2);
 }
@@ -157,4 +167,60 @@ async fn sequence_dispatch() {
 fn integer_coordinates_are_intentionally_strict() {
     assert!(taa_tools::validate("move_pointer", &json!({"x":2,"y":3}), (1280, 720)).is_ok());
     assert!(taa_tools::validate("move_pointer", &json!({"x":2.0,"y":3}), (1280, 720)).is_err());
+}
+
+#[tokio::test]
+async fn typed_mapping_and_encoding() {
+    use base64::Engine;
+    use taa_platform::{
+        pixels::{decode_png, Point},
+        Button, Key, Operation,
+    };
+    let c = Config::default();
+    let p = Arc::new(MockPlatform::recording());
+    let r = execute(
+        "left_click",
+        &json!({"x":640,"y":360,"modifiers":"ctrl"}),
+        &c,
+        p.clone(),
+    )
+    .await;
+    assert_eq!(r["isError"], false);
+    assert_eq!(
+        p.operations.lock().unwrap()[0],
+        Operation::Click(Point { x: 960, y: 540 }, Button::Left, 1, vec![Key(0xffe3)])
+    );
+    let r = execute("screenshot", &json!({}), &c, p.clone()).await;
+    assert_eq!(r["content"][0]["mimeType"], "image/png");
+    let b = base64::engine::general_purpose::STANDARD
+        .decode(r["content"][0]["data"].as_str().unwrap())
+        .unwrap();
+    let f = decode_png(&b).unwrap();
+    assert_eq!((f.width, f.height), (1280, 720));
+    assert_eq!(&f.rgba[..4], &[40, 80, 120, 255]);
+    for args in [json!({"keys":"ctrl+not_a_key"}), json!({"keys":"F25"})] {
+        assert!(
+            execute("key", &args, &c, p.clone()).await["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("CLIENT_ERROR:")
+        );
+    }
+    assert!(validate(
+        "left_click",
+        &json!({"x":0,"y":0,"modifiers":"ctrl+a"}),
+        (1280, 720)
+    )
+    .is_err());
+    let mut c = c;
+    c.agent_access.screen_resolution = "native".into();
+    assert_eq!(screen(&c, p.as_ref()), (1920, 1080));
+    assert_eq!(
+        execute("left_click", &json!({"x":1919,"y":1079}), &c, p.clone()).await["isError"],
+        false
+    );
+    assert_eq!(
+        p.operations.lock().unwrap().last().unwrap(),
+        &Operation::Click(Point { x: 1919, y: 1079 }, Button::Left, 1, vec![])
+    );
 }
