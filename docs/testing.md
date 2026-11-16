@@ -47,3 +47,9 @@ cargo test -p taa-tools --test x11_e2e -- --ignored --nocapture
 ```
 
 The Linux cross-target CI job includes macOS ARM check and clippy for fork PRs; it only type-checks without an SDK, never links or runs macOS code. No hosted macOS runner is used. Native macOS/Windows mapping audits compile in cross-checks but execute only on their own OS runners. Mac printable ASCII tests also run on Linux. See the external review disposition for exact local validation results and remaining platform blockers.
+
+## M3 coverage
+
+Sequence tests cover exact rejection text and JSON rows, count/wait/text boundaries (Unicode scalars), prefixed and SAMPLE short names, nesting/unknown/gated actions, shared validators, success timing/image shape, paused-clock wait deadlines, skipped stabilization after wait, first failure and terminal capture failure. Storage tests use temporary directories for PNG/JPEG layout, Unix permissions, disabled saving, invalid paths/IDs, directory symlinks, nonfatal failures and terminal images. HTTP tests check modern ID markers on sequence success/rejection/failure, repeated close, post-close refusal and held-button release. Existing transport tests cover JSON-RPC error.data.mcpSessionId.
+
+The ignored Xvfb test now also runs move_pointer + left_click + wait + key and checks the terminal image and summary. The Python SDK script calls sequence success and rejection in both legacy/stateful and modern/stateless modes; it requires a working desktop backend for the terminal image. Start the isolated Xvfb and HTTP server described above, run `/tmp/mcpvenv/bin/python scripts/interop_python_sdk.py`, then stop both processes. Cross-target check/clippy commands above remain required for M3.

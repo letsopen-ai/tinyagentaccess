@@ -36,13 +36,25 @@ async def run(url):
             assert not wait.is_error
             bad = await client.call_tool("agentaccess___wait", {**args, "duration": 0})
             assert bad.is_error
+            sequence = await client.call_tool("agentaccess___execute_sequence", {
+                **args, "actions": [{"type": "agentaccess___wait", "duration": 0.001}]
+            })
+            assert not sequence.is_error
+            assert any(block.type == "image" for block in sequence.content)
+            rejected = await client.call_tool("agentaccess___execute_sequence", {
+                **args, "actions": [{"type": "wait", "duration": 0}]
+            })
+            assert rejected.is_error
+            assert all(block.type == "text" for block in rejected.content)
             if modern:
+                assert session_id(sequence) == args["mcpSessionId"]
+                assert session_id(rejected) == args["mcpSessionId"]
                 assert session_id(bad) == args["mcpSessionId"]
                 for _ in range(2):
                     closed = await client.call_tool("agentaccess___close_session", args)
                     assert not closed.is_error
                     assert session_id(closed) == args["mcpSessionId"]
-            print(f"PASS {mode}: list, session info, wait, error, close")
+            print(f"PASS {mode}: list, session info, wait, sequence success/rejection, error, close")
 
 
 if __name__ == "__main__":

@@ -246,35 +246,36 @@ async fn real_x11_desktop() {
     }
     stop.store(true, Ordering::Relaxed);
     recorder.join().unwrap();
-    let events = events.lock().unwrap();
-    let expected = Point { x: 600, y: 450 };
-    assert!(events.iter().any(|(e,_)|matches!(e,Event::ButtonPress(b) if b.detail==1&&b.root_x==expected.x as i16&&b.root_y==expected.y as i16)));
-    for sym in [
-        0x61, 0x65, 0x01004e2d, 0x0101f600, 0x01000301, 0xff0d, 0xff09, 0xffe3, 0x72,
-    ] {
-        assert!(
-            events.iter().any(|(_, s)| *s == Some(sym)),
-            "missing keysym {sym:x}: {events:?}"
-        );
+    {
+        let events = events.lock().unwrap();
+        let expected = Point { x: 600, y: 450 };
+        assert!(events.iter().any(|(e,_)|matches!(e,Event::ButtonPress(b) if b.detail==1&&b.root_x==expected.x as i16&&b.root_y==expected.y as i16)));
+        for sym in [
+            0x61, 0x65, 0x01004e2d, 0x0101f600, 0x01000301, 0xff0d, 0xff09, 0xffe3, 0x72,
+        ] {
+            assert!(
+                events.iter().any(|(_, s)| *s == Some(sym)),
+                "missing keysym {sym:x}: {events:?}"
+            );
+        }
+        assert!(events
+            .iter()
+            .any(|(e, _)| matches!(e,Event::KeyPress(k) if k.state.contains(KeyButMask::CONTROL))));
+        for (button, count) in [(4, 2), (5, 1)] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(e, _)| matches!(e,Event::ButtonPress(b) if b.detail==button))
+                    .count(),
+                count
+            );
+        }
+        assert!(events.iter().any(
+            |(e, _)| matches!(e,Event::MotionNotify(m) if m.state.contains(KeyButMask::BUTTON1))
+        ));
+        let end = Point { x: 750, y: 525 };
+        assert!(events.iter().any(|(e,_)|matches!(e,Event::ButtonRelease(b) if b.detail==1&&b.root_x==end.x as i16&&b.root_y==end.y as i16)));
     }
-    assert!(events
-        .iter()
-        .any(|(e, _)| matches!(e,Event::KeyPress(k) if k.state.contains(KeyButMask::CONTROL))));
-    for (button, count) in [(4, 2), (5, 1)] {
-        assert_eq!(
-            events
-                .iter()
-                .filter(|(e, _)| matches!(e,Event::ButtonPress(b) if b.detail==button))
-                .count(),
-            count
-        );
-    }
-    assert!(events
-        .iter()
-        .any(|(e, _)| matches!(e,Event::MotionNotify(m) if m.state.contains(KeyButMask::BUTTON1))));
-    let end = Point { x: 750, y: 525 };
-    assert!(events.iter().any(|(e,_)|matches!(e,Event::ButtonRelease(b) if b.detail==1&&b.root_x==end.x as i16&&b.root_y==end.y as i16)));
-    drop(events);
     server.0.kill().unwrap();
     server.0.wait().unwrap();
     assert!(p.capture().is_err());
@@ -296,4 +297,22 @@ async fn real_x11_desktop() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    let p: Arc<dyn Platform> = Arc::new(X11::connect(&display).unwrap());
+    let sequence = taa_tools::sequence(
+        &json!({"actions":[
+            {"type":"agentaccess___move_pointer","x":300,"y":200},
+            {"type":"agentaccess___left_click","x":300,"y":200},
+            {"type":"wait","duration":0.001},
+            {"type":"key","keys":"a"}
+        ]}),
+        &config,
+        p,
+    )
+    .await;
+    assert_eq!(sequence["isError"], false, "{sequence}");
+    let summary: serde_json::Value =
+        serde_json::from_str(sequence["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(summary["sequence_summary"]["succeeded"], 4);
+    assert_eq!(summary["terminal_screenshot"]["status"], "success");
+    assert_eq!(sequence["content"][1]["type"], "image");
 }

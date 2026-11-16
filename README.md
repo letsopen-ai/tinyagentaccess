@@ -48,3 +48,12 @@ See [verified AWS parity facts](docs/aws-parity.md), [design and compatibility d
 Licensed under the [MIT License](LICENSE).
 
 Wildcard binds (`0.0.0.0` / `::`) are rejected because this server has no authentication. Use the loopback default or an explicit concrete IP; non-loopback binds emit a no-auth warning and only that IP or loopback Host values are accepted.
+
+Local screenshot saving is optional and disabled by default:
+
+```toml
+[screenshots]
+save_dir = "" # or an absolute private directory, e.g. /home/me/screenshots
+```
+
+Returned standalone and sequence terminal images are saved under `agentaccess/screenshots/year=YYYY/month=MM/day=DD/{session-id}/` using UTC epoch-millisecond filenames and the real PNG/JPEG extension. Unix directories/files use 0700/0600 when created; Windows inherits directory ACLs. Save failures warn on stderr and leave tool results intact. Relative save paths are rejected. No cloud upload occurs.

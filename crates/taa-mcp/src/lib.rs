@@ -42,6 +42,7 @@ struct Session {
     version: String,
     touched: Instant,
     active: usize,
+    held: Arc<Mutex<Option<taa_platform::Point>>>,
 }
 #[derive(Default)]
 struct Sessions {
@@ -86,6 +87,7 @@ impl Server {
                 version: version.into(),
                 touched: Instant::now(),
                 active: 0,
+                held: Arc::default(),
             },
         );
         Ok(id)
@@ -97,10 +99,70 @@ impl Server {
         v.touched = Instant::now();
         Some(v.version.clone())
     }
+    async fn release(&self, id: &str) {
+        let held = self
+            .sessions
+            .lock()
+            .unwrap()
+            .open
+            .get(id)
+            .map(|s| s.held.clone());
+        if let Some(held) = held {
+            let p = self.platform.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(point) = held.lock().unwrap().take() {
+                    if let Err(e) = p.perform(taa_platform::Operation::Button(point, false, vec![]))
+                    {
+                        eprintln!("warning: session input release failed: {e}");
+                    }
+                }
+            })
+            .await;
+        }
+    }
     fn close(&self, id: &str) {
         let mut s = self.sessions.lock().unwrap();
         s.open.remove(id);
         s.closed.insert(id.into(), Instant::now());
+    }
+}
+// Hold-key releases synchronously in every backend; only button-down persists.
+struct SessionPlatform {
+    inner: Arc<dyn Platform>,
+    held: Arc<Mutex<Option<taa_platform::Point>>>,
+}
+impl Platform for SessionPlatform {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn screen_size(&self) -> (u32, u32) {
+        self.inner.screen_size()
+    }
+    fn capture(&self) -> Result<taa_platform::Frame, String> {
+        self.inner.capture()
+    }
+    fn capture_geometry(&self) -> Result<(u32, u32), String> {
+        self.inner.capture_geometry()
+    }
+    fn perform(&self, op: taa_platform::Operation) -> Result<(), String> {
+        // Track before dispatch too: a partial native failure may already have pressed it.
+        if let taa_platform::Operation::Button(point, true, _) = &op {
+            *self.held.lock().unwrap() = Some(*point);
+        }
+        let result = self.inner.perform(op.clone());
+        if result.is_ok() {
+            match op {
+                taa_platform::Operation::Button(_, false, _)
+                | taa_platform::Operation::Drag(_, _) => *self.held.lock().unwrap() = None,
+                taa_platform::Operation::Move(point) => {
+                    if let Some(p) = self.held.lock().unwrap().as_mut() {
+                        *p = point;
+                    }
+                }
+                _ => (),
+            }
+        }
+        result
     }
 }
 // Drop also runs if the HTTP task is cancelled.
@@ -200,6 +262,8 @@ async fn delete(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
         )
             .into_response();
     }
+    let _desktop = s.desktop.lock().await;
+    s.release(id).await;
     s.close(id);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -386,7 +450,11 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
     if (!version.is_empty() && !modern && !STATEFUL.contains(&version))
         || (method == "server/discover" && !modern)
     {
-        return (StatusCode::BAD_REQUEST, Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":[MODERN],"requested":version}}}))).into_response();
+        let mut data = json!({"supported":[MODERN],"requested":version});
+        if let Some(sid) = args_session(&params) {
+            data["mcpSessionId"] = json!(sid);
+        }
+        return (StatusCode::BAD_REQUEST, Json(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32022,"message":"Unsupported protocol version","data":data}}))).into_response();
     }
     if modern && v.get("id").is_none() {
         return StatusCode::ACCEPTED.into_response();
@@ -570,7 +638,7 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             }
             // Admission and closure are atomic with respect to the session map.
             // The desktop lock prevents another tool close from overtaking admission.
-            let active = {
+            let (active, held) = {
                 let mut sessions = s.sessions.lock().unwrap();
                 let Some(session) = sessions.open.get_mut(&sid) else {
                     return if modern {
@@ -580,16 +648,23 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                     };
                 };
                 session.active += 1;
-                ActiveSession(s.clone(), sid.clone())
+                (ActiveSession(s.clone(), sid.clone()), session.held.clone())
             };
+            let platform: Arc<dyn Platform> = Arc::new(SessionPlatform {
+                inner: s.platform.clone(),
+                held,
+            });
             let r = if !taa_tools::NAMES.contains(&n) || !taa_tools::visible(n, &s.config, modern) {
                 client("Unknown tool")
-            } else if let Err(e) =
+            } else if let Err(e) = if n == "execute_sequence" {
+                Ok(())
+            } else {
                 taa_tools::validate(n, &args, taa_tools::screen(&s.config, s.platform.as_ref()))
-            {
+            } {
                 client(e)
             } else {
                 match n {
+                    // PROVISIONAL (not published by AWS): local metadata fields/JSON encoding.
                     "get_session_info" => {
                         let (w, height) = taa_tools::screen(&s.config, s.platform.as_ref());
                         if w == 0 || height == 0 {
@@ -598,16 +673,27 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                             result(json!({"mcpSessionId":sid,"hostname":std::env::var("HOSTNAME").or_else(|_|std::env::var("COMPUTERNAME")).unwrap_or_else(|_|"localhost".into()),"os":std::env::consts::OS,"platformBackend":s.platform.name(),"screen":{"width":w,"height":height},"protocolVersion":actual_version,"serverVersion":env!("CARGO_PKG_VERSION")}).to_string(),false)
                         }
                     }
+                    // PROVISIONAL (not published by AWS): closed text; expire_streaming_session has no local effect.
                     "close_session" => {
+                        s.release(&sid).await;
                         s.close(&sid);
                         result("Session closed", false)
                     }
                     "execute_sequence" => {
-                        taa_tools::sequence(&args, &s.config, s.platform.clone()).await
+                        taa_tools::sequence(&args, &s.config, platform.clone()).await
                     }
-                    _ => taa_tools::execute(n, &args, &s.config, s.platform.clone()).await,
+                    _ => taa_tools::execute(n, &args, &s.config, platform.clone()).await,
                 }
             };
+            if !s.config.screenshots.save_dir.is_empty() {
+                let dir = s.config.screenshots.save_dir.clone();
+                let save_id = sid.clone();
+                let saved = r.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    taa_tools::screenshots::save_result(&dir, &save_id, &saved)
+                })
+                .await;
+            }
             drop(active);
             if modern {
                 modern_result(&id, r, &sid)
