@@ -2,16 +2,18 @@ use serde_json::json;
 use std::time::Duration;
 use taa_forward::{forwarded_name, parse_config, rpc_error, ForwardingSet, Timeouts};
 fn fixture(mode: &str, extra: &[&str]) -> (tempfile::TempDir, std::sync::Arc<ForwardingSet>) {
+    fixture_with_limits(mode, extra, Timeouts::default())
+}
+
+fn fixture_with_limits(
+    mode: &str,
+    extra: &[&str],
+    limits: Timeouts,
+) -> (tempfile::TempDir, std::sync::Arc<ForwardingSet>) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("forward.json");
     let args: Vec<_> = std::iter::once(mode).chain(extra.iter().copied()).collect();
     std::fs::write(&path, json!({"mcpServers":{"fixture":{"command":env!("CARGO_BIN_EXE_taa-fake-mcp-server"),"args":args}}}).to_string()).unwrap();
-    let limits = Timeouts {
-        request: Duration::from_millis(150),
-        initialize: Duration::from_millis(300),
-        graceful: Duration::from_millis(100),
-        teardown: Duration::from_secs(1),
-    };
     (dir, ForwardingSet::new(path, limits))
 }
 #[test]
@@ -88,8 +90,44 @@ async fn discovery_modes() {
         ("slow-list", 0),
         ("slow-init", 0),
     ] {
-        let (_dir, set) = fixture(mode, &["1"]);
-        assert_eq!(set.list().await.len(), count, "{mode}");
+        if mode == "slow-init" {
+            // Pay first-exec scanning costs before testing an initialize deadline.
+            let (_warm_dir, warm) = fixture("good", &[]);
+            assert_eq!(warm.list().await.len(), 4);
+            warm.teardown().await;
+        }
+        // Only these modes test deadlines. Leave normal startup and requests
+        // at production limits, including first-exec scanning on macOS.
+        let limits = Timeouts {
+            request: if mode == "slow-list" {
+                Duration::from_millis(500)
+            } else {
+                Timeouts::default().request
+            },
+            initialize: if mode == "slow-init" {
+                Duration::from_secs(5)
+            } else {
+                Timeouts::default().initialize
+            },
+            ..Timeouts::default()
+        };
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let (_dir, set) = fixture_with_limits(
+            mode,
+            &["10", "--request-file", marker.path().to_str().unwrap()],
+            limits,
+        );
+        if mode == "slow-init" {
+            let listing = {
+                let set = set.clone();
+                tokio::spawn(async move { set.list().await })
+            };
+            // Observe initialize before cancellation overwrites the request marker.
+            wait_for_request(marker.path(), "initialize").await;
+            assert!(listing.await.unwrap().is_empty());
+        } else {
+            assert_eq!(set.list().await.len(), count, "{mode}");
+        }
         set.teardown().await;
     }
 }
@@ -97,7 +135,16 @@ async fn discovery_modes() {
 async fn timeout_sends_cancel() {
     let marker = tempfile::NamedTempFile::new().unwrap();
     let path = marker.path().to_str().unwrap();
-    let (_dir, set) = fixture("slow-call", &["1", "--cancel-file", path]);
+    let (_dir, set) = fixture_with_limits(
+        "slow-call",
+        &["10", "--cancel-file", path],
+        Timeouts {
+            request: Duration::from_millis(500),
+            ..Timeouts::default()
+        },
+    );
+    // Complete startup/discovery before exercising the call deadline.
+    assert_eq!(set.list().await.len(), 4);
     let result = set.call("forwarded___fixture___echo", json!({})).await;
     assert_eq!(
         result["content"][0]["text"],
@@ -179,28 +226,38 @@ async fn teardown_interrupts_hung_initialize() {
     let marker = tempfile::NamedTempFile::new().unwrap();
     let (_dir, set) = fixture(
         "slow-init",
-        &["10", "--request-file", marker.path().to_str().unwrap()],
+        &["120", "--request-file", marker.path().to_str().unwrap()],
     );
     let listing = {
         let set = set.clone();
         tokio::spawn(async move { set.list().await })
     };
     wait_for_request(marker.path(), "initialize").await;
-    set.teardown().await;
-    assert!(listing.await.unwrap().is_empty());
+    // Startup has completed. Teardown must interrupt initialize well before
+    // its 60s deadline (and the fixture's 120s response).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        set.teardown().await;
+        assert!(listing.await.unwrap().is_empty());
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn warm_retry_and_list_cancel() {
     let marker = tempfile::NamedTempFile::new().unwrap();
-    let (_dir, set) = fixture(
+    let (_dir, set) = fixture_with_limits(
         "slow-list",
         &[
-            "1",
+            "10",
             "--warm-retry",
             "--cancel-file",
             marker.path().to_str().unwrap(),
         ],
+        Timeouts {
+            request: Duration::from_millis(500),
+            ..Timeouts::default()
+        },
     );
     assert!(set.list().await.is_empty());
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -283,7 +340,7 @@ async fn teardown_kills_uncooperative_child() {
 }
 
 async fn wait_for_request(path: &std::path::Path, method: &str) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if std::fs::read_to_string(path).unwrap_or_default() == method {
                 break;
@@ -313,7 +370,7 @@ async fn healthy_calls_during_slow_discovery() {
         .unwrap();
         let limits = Timeouts {
             request: Duration::from_millis(500),
-            initialize: Duration::from_millis(500),
+            initialize: Duration::from_secs(5),
             graceful: Duration::from_millis(100),
             teardown: Duration::from_secs(1),
         };
