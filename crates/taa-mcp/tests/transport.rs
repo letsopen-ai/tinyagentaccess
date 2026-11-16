@@ -746,6 +746,156 @@ async fn delete_rejects_version_mismatch_without_closing_session() {
     }
 }
 
+#[tokio::test]
+async fn modern_sequence_results_and_close_release() {
+    for available in [true, false] {
+        let p = Arc::new(if available {
+            MockPlatform::recording()
+        } else {
+            MockPlatform::default()
+        });
+        let a = router(Server::new(Config::default(), p.clone()));
+        let h = [("mcp-protocol-version", MODERN)];
+        let r = value(
+            &request(
+                &a,
+                "POST",
+                call("get_session_info", json!({"mcpSessionId":"NEW"})),
+                &h,
+            )
+            .await
+            .2,
+        );
+        let sid = r["result"]["mcpSessionId"].as_str().unwrap();
+        for (actions, error) in [
+            (
+                json!([{"type":"key","keys":"a"},{"type":"wait","duration":0.001}]),
+                !available,
+            ),
+            (json!([{"type":"wait","duration":0}]), true),
+        ] {
+            let r = value(
+                &request(
+                    &a,
+                    "POST",
+                    call(
+                        "execute_sequence",
+                        json!({"mcpSessionId":sid,"actions":actions}),
+                    ),
+                    &h,
+                )
+                .await
+                .2,
+            );
+            assert_eq!(r["result"]["isError"], error);
+            let blocks = r["result"]["content"].as_array().unwrap();
+            assert_eq!(
+                value(blocks.last().unwrap()["text"].as_str().unwrap()),
+                json!({"mcpSessionId":sid})
+            );
+        }
+        if available {
+            let r = value(
+                &request(
+                    &a,
+                    "POST",
+                    call("left_mouse_down", json!({"mcpSessionId":sid,"x":10,"y":20})),
+                    &h,
+                )
+                .await
+                .2,
+            );
+            assert_eq!(r["result"]["isError"], false);
+        }
+        for _ in 0..2 {
+            let r = value(
+                &request(
+                    &a,
+                    "POST",
+                    call("close_session", json!({"mcpSessionId":sid})),
+                    &h,
+                )
+                .await
+                .2,
+            );
+            assert_eq!(r["result"]["isError"], false);
+            assert_eq!(
+                value(
+                    r["result"]["content"].as_array().unwrap().last().unwrap()["text"]
+                        .as_str()
+                        .unwrap()
+                ),
+                json!({"mcpSessionId":sid})
+            );
+        }
+        if available {
+            assert!(matches!(
+                p.operations.lock().unwrap().last().unwrap(),
+                taa_platform::Operation::ReleaseLeft
+            ));
+        }
+        let r = value(
+            &request(
+                &a,
+                "POST",
+                call("wait", json!({"mcpSessionId":sid,"duration":0.001})),
+                &h,
+            )
+            .await
+            .2,
+        );
+        assert_eq!(r["result"]["isError"], true);
+    }
+}
+
+#[tokio::test]
+async fn transport_saves_standalone_and_terminal_images() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = Config::default();
+    c.screenshots.save_dir = tmp.path().canonicalize().unwrap().to_str().unwrap().into();
+    let a = router(Server::new(c, Arc::new(MockPlatform::recording())));
+    let h = [("mcp-protocol-version", MODERN)];
+    let r = value(
+        &request(
+            &a,
+            "POST",
+            call("screenshot", json!({"mcpSessionId":"NEW"})),
+            &h,
+        )
+        .await
+        .2,
+    );
+    assert_eq!(r["result"]["isError"], false);
+    let sid = r["result"]["mcpSessionId"].as_str().unwrap();
+    let r = value(
+        &request(
+            &a,
+            "POST",
+            call(
+                "execute_sequence",
+                json!({"mcpSessionId":sid,"actions":[{"type":"wait","duration":0.001}]}),
+            ),
+            &h,
+        )
+        .await
+        .2,
+    );
+    assert_eq!(r["result"]["isError"], false);
+    fn count(path: &std::path::Path) -> usize {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|e| {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    count(&p)
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+    assert_eq!(count(tmp.path()), 2);
+}
 struct GrownDisplay {
     mock: MockPlatform,
     refreshes: std::sync::atomic::AtomicUsize,

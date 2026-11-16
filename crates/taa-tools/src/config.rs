@@ -89,6 +89,12 @@ impl Config {
         if !["auto", "wayland", "x11"].contains(&self.platform.linux_backend.as_str()) {
             return Err("invalid platform.linux_backend".into());
         }
+        // PROVISIONAL (not published by AWS): reject relative screenshot paths.
+        if !self.screenshots.save_dir.is_empty()
+            && !std::path::Path::new(&self.screenshots.save_dir).is_absolute()
+        {
+            return Err("screenshots.save_dir must be absolute".into());
+        }
         if self.sessions.max_sessions == 0 || self.sessions.idle_timeout_secs == 0 {
             return Err("session limits must be positive".into());
         }

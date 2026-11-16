@@ -15,6 +15,7 @@ taa-tools .workspace = true
 taa-platform .workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies.taa-platform]

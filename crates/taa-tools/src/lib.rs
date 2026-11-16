@@ -1,13 +1,15 @@
 pub mod config;
+pub mod screenshots;
 use base64::Engine;
 use config::Config;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use taa_platform::{
     pixels::{Mapping, Point},
     Button, Operation, Platform, ScrollDirection,
 };
+use tokio::time::Instant;
 pub const PREFIX: &str = "agentaccess___";
 pub const NAMES: &[&str] = &[
     "left_click",
@@ -114,7 +116,7 @@ pub fn schema(n: &str, modern: bool) -> Value {
     json!({"type":"object","properties":p,"required":required,"additionalProperties":false})
 }
 pub fn list(c: &Config, modern: bool) -> Value {
-    json!({"tools":NAMES.iter().filter(|n|visible(n,c,modern)).map(|n|json!({"name":format!("{PREFIX}{n}"),"description":match *n {"screenshot"=>"Capture desktop; returned image dimensions define the coordinate space for all mouse tools.","execute_sequence"=>"Run at most 20 actions; cumulative wait ≤ 10 s, cumulative type_text ≤ 10,000 chars, 60 s deadline. screenshot/execute_sequence cannot be nested.","close_session"=>"End session (stateless protocol).",
+    json!({"tools":NAMES.iter().filter(|n|visible(n,c,modern)).map(|n|json!({"name":format!("{PREFIX}{n}"),"description":match *n {"screenshot"=>"Capture desktop; returned image dimensions define the coordinate space for all mouse tools.","execute_sequence"=>"Run at most 20 native actions; each wait 0.001–5 s, cumulative wait ≤ 10 s, cumulative type_text ≤ 10,000 chars, 60 s deadline. screenshot/execute_sequence cannot be nested.","close_session"=>"End session (stateless protocol).",
 "left_click"=>"Left click at coordinates, with optional modifiers.",
 "double_click"=>"Double left click at coordinates.",
 "triple_click"=>"Triple left click at coordinates.",
@@ -142,6 +144,7 @@ fn validate_arguments(n: &str, a: &Value, screen: Option<(u32, u32)>) -> Result<
     if !a.is_object() {
         return Err("arguments must be an object".into());
     }
+    // PROVISIONAL (not published by AWS): standalone wait validation wording follows sequence sample.
     if n == "wait"
         && !a["duration"]
             .as_f64()
@@ -247,6 +250,7 @@ pub async fn execute(n: &str, a: &Value, c: &Config, p: Arc<dyn Platform>) -> Va
     ) {
         return client(e);
     }
+    // PROVISIONAL (not published by AWS): standalone wait success text.
     if n == "wait" {
         tokio::time::sleep(Duration::from_secs_f64(a["duration"].as_f64().unwrap())).await;
         return result("Wait completed", false);
@@ -369,6 +373,7 @@ fn execute_blocking(n: &str, a: &Value, c: &Config, p: &dyn Platform) -> Value {
     }
 }
 
+// PROVISIONAL (not published by AWS): short names accepted from SAMPLE S-agentsmd only.
 fn short(a: &Value) -> &str {
     a["type"]
         .as_str()
@@ -376,19 +381,57 @@ fn short(a: &Value) -> &str {
         .strip_prefix(PREFIX)
         .unwrap_or(a["type"].as_str().unwrap_or(""))
 }
+// PROVISIONAL (not published by AWS): stabilization length and injectable local timing.
+pub const STABILIZATION: Duration = Duration::from_millis(300);
+#[derive(Clone, Copy)]
+pub struct SequenceLimits {
+    pub deadline: Duration,
+    pub stabilization: Duration,
+}
+impl Default for SequenceLimits {
+    fn default() -> Self {
+        Self {
+            deadline: Duration::from_secs(60),
+            stabilization: STABILIZATION,
+        }
+    }
+}
 pub async fn sequence(a: &Value, c: &Config, p: Arc<dyn Platform>) -> Value {
-    let Some(actions) = a["actions"].as_array() else {
-        return client("actions must be an array");
-    };
+    sequence_with_limits(a, c, p, SequenceLimits::default()).await
+}
+pub async fn sequence_with_limits(
+    a: &Value,
+    c: &Config,
+    p: Arc<dyn Platform>,
+    limits: SequenceLimits,
+) -> Value {
+    let empty = vec![];
+    let actions = a["actions"].as_array().unwrap_or(&empty);
     let mut reason = None;
     let mut at = 0;
+    // Allow only floating-point summation noise at the inclusive 10-second boundary.
+    const WAIT_LIMIT: f64 = 10.0 + 1e-9;
     let mut wait = 0.0;
     let mut chars = 0;
-    if actions.len() > 20 {
+    // PROVISIONAL (not published by AWS): count first, then ordered argument checks,
+    // then cumulative totals; empty/malformed arrays and session/forwarded tools rejected.
+    if !a["actions"].is_array() {
+        reason = Some("actions must be an array".into());
+    } else if actions.len() > 20 {
+        at = 20;
         reason = Some(format!("too many actions: {} > 20", actions.len()));
+    } else if actions.is_empty() {
+        reason = Some("actions must not be empty".into());
     }
     let native = c.agent_access.screen_resolution == "native";
     let size = screen(c, p.as_ref());
+    if reason.is_none() {
+        if let Err(e) = validate_shape("execute_sequence", a) {
+            reason = Some(e);
+        }
+    }
+    let mut wait_crossed = 0;
+    let mut chars_crossed = 0;
     for (i, action) in actions.iter().enumerate() {
         if reason.is_some() {
             break;
@@ -399,42 +442,45 @@ pub async fn sequence(a: &Value, c: &Config, p: Arc<dyn Platform>) -> Value {
         if let Some(o) = args.as_object_mut() {
             o.remove("type");
         }
-        let e = if !NAMES.contains(&n)
-            || matches!(
-                n,
-                "screenshot" | "execute_sequence" | "close_session" | "get_session_info"
-            )
+        let e = if matches!(n, "screenshot" | "execute_sequence") {
+            Err(format!("{n} cannot be nested in execute_sequence"))
+        } else if !NAMES.contains(&n)
+            || matches!(n, "close_session" | "get_session_info")
             || !visible(n, c, false)
         {
-            Err("action cannot be nested or is unavailable".into())
+            Err("Unknown tool".into())
+        } else if native {
+            validate_shape(n, &args)
         } else {
-            if native {
-                validate_shape(n, &args)
-            } else {
-                validate(n, &args, size)
-            }
+            validate(n, &args, size)
         };
         if let Err(e) = e {
             reason = Some(format!("action {i}: {e}"));
             break;
         }
         if n == "wait" {
+            let previous = wait;
             wait += action["duration"].as_f64().unwrap();
+            if previous <= WAIT_LIMIT && wait > WAIT_LIMIT {
+                wait_crossed = i;
+            }
         }
         if n == "type_text" {
+            let previous = chars;
+            // Unicode scalar values, matching standalone validation (not UTF-8 bytes).
             chars += action["text"].as_str().unwrap().chars().count();
-        }
-        if native && wait > 10.0 {
-            reason = Some(format!("cumulative wait {wait:.1}s exceeds 10.0s"));
-        }
-        if native && reason.is_none() && chars > 10000 {
-            reason = Some(format!("cumulative type_text length {chars} exceeds 10000"));
+            if previous <= 10000 && chars > 10000 {
+                chars_crossed = i;
+            }
         }
     }
-    if reason.is_none() && wait > 10.0 {
+    // The displayed wait total rounds to one decimal, independently of comparison precision.
+    if reason.is_none() && wait > WAIT_LIMIT {
+        at = wait_crossed;
         reason = Some(format!("cumulative wait {wait:.1}s exceeds 10.0s"));
     }
     if reason.is_none() && chars > 10000 {
+        at = chars_crossed;
         reason = Some(format!("cumulative type_text length {chars} exceeds 10000"));
     }
     // Native bounds depend on fresh geometry, but malformed sequences must never
@@ -460,48 +506,97 @@ pub async fn sequence(a: &Value, c: &Config, p: Arc<dyn Platform>) -> Value {
         }
     }
     if let Some(reason) = reason {
-        let body = json!({"sequence_summary":{"submitted":actions.len(),"executed":0,"succeeded":0,"stopped_at_index":at,"stop_reason":reason,"guidance":"Correct the sequence and retry. No desktop action ran, so no screenshot is needed."},"action_results":actions.iter().enumerate().map(|(i,a)|json!({"index":i,"action":short(a),"status":"skipped","reason":"sequence rejected before dispatch"})).collect::<Vec<_>>()});
-        let mut r = result(body.to_string(), true);
-        r["content"].as_array_mut().unwrap().push(text(format!(
-            "CLIENT_ERROR: Rejected before dispatch: {reason}"
-        )));
-        return r;
+        return result(json!({"sequence_summary":{"submitted":actions.len(),"executed":0,"succeeded":0,"stopped_at_index":at,"stop_reason":format!("CLIENT_ERROR: Rejected before dispatch: {reason}"),"guidance":"Correct the sequence and retry. No desktop action ran, so no screenshot is needed."},"action_results":actions.iter().enumerate().map(|(i,a)|json!({"index":i,"action":short(a),"status":"skipped","reason":"sequence rejected before dispatch"})).collect::<Vec<_>>()}).to_string(), true);
     }
-    let start = Instant::now();
+    let deadline = Instant::now() + limits.deadline;
     let mut rows = vec![];
-    let mut failed = false;
+    let mut stop: Option<String> = None;
+    let mut stopped_at = None;
     let mut executed = 0;
     let mut succeeded = 0;
+    // PROVISIONAL (not published by AWS): error/skipped statuses and failure guidance.
     for (i, a) in actions.iter().enumerate() {
         let n = short(a);
-        if failed || start.elapsed() >= Duration::from_secs(60) {
-            failed = true;
-            rows.push(json!({"index":i,"action":n,"status":"skipped","reason":"Deadline reached or previous action failed"}));
+        if stop.is_none() && Instant::now() >= deadline {
+            stop = Some(format!("Deadline reached before action {i}"));
+            stopped_at = Some(i);
+        }
+        if stop.is_some() {
+            rows.push(json!({"index":i,"action":n,"status":"skipped","reason":"sequence stopped before action"}));
             continue;
         }
         let mut args = a.clone();
         args.as_object_mut().unwrap().remove("type");
         let t = Instant::now();
-        let r = execute(n, &args, c, p.clone()).await;
+        let r = if n == "wait" {
+            let end = t + Duration::from_secs_f64(a["duration"].as_f64().unwrap());
+            // Clamp in-progress waits; native blocking calls cannot safely be interrupted.
+            tokio::time::sleep_until(end.min(deadline)).await;
+            if Instant::now() >= deadline {
+                // PROVISIONAL: i + 1 is the first undispatched action; stopped_at_index
+                // remains i, the interrupted wait (AWS documents only the message text).
+                result(format!("Deadline reached before action {}", i + 1), true)
+            } else {
+                result("Wait completed", false)
+            }
+        } else {
+            execute(n, &args, c, p.clone()).await
+        };
         executed += 1;
-        failed = r["isError"] == true;
-        if !failed {
+        if r["isError"] == true {
+            let reason = r["content"][0]["text"].as_str().unwrap_or("Action failed");
+            stop = Some(reason.into());
+            stopped_at = Some(i);
+            rows.push(json!({"index":i,"action":n,"status":"error","duration_ms":t.elapsed().as_millis(),"reason":reason}));
+        } else {
             succeeded += 1;
+            rows.push(json!({"index":i,"action":n,"status":"success","duration_ms":t.elapsed().as_millis()}));
         }
-        rows.push(json!({"index":i,"action":n,"status":if failed{"failed"}else{"success"},"duration_ms":t.elapsed().as_millis(),"result":r}));
     }
     let mut contents = vec![];
-    let mut terminal = json!({"status":"skipped"});
-    if !failed {
-        let r = execute("screenshot", &json!({}), c, p.clone()).await;
-        failed = r["isError"] == true;
-        terminal = json!({"status":if failed{"failed"}else{"success"}});
-        if !failed {
-            contents.extend(r["content"].as_array().unwrap().clone());
+    let mut terminal = None;
+    if stop.is_none() {
+        if actions.last().is_some_and(|a| short(a) != "wait") {
+            tokio::time::sleep_until((Instant::now() + limits.stabilization).min(deadline)).await;
+        }
+        if Instant::now() >= deadline {
+            stop = Some("Deadline reached before terminal screenshot".into());
+        } else if !c.agent_access.computer_vision {
+            // PROVISIONAL (not published by AWS): vision-disabled terminal is skipped successfully.
+            terminal = Some(json!({"status":"skipped","reason":"computer vision disabled"}));
+        } else {
+            let t = Instant::now();
+            let r = execute("screenshot", &json!({}), c, p).await;
+            // PROVISIONAL (not published by AWS): terminal capture failure is an error, without image.
+            if r["isError"] == true || Instant::now() >= deadline {
+                let reason = if Instant::now() >= deadline {
+                    "Deadline reached during terminal screenshot"
+                } else {
+                    r["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or("Screenshot failed")
+                };
+                stop = Some(reason.into());
+                terminal = Some(
+                    json!({"status":"error","duration_ms":t.elapsed().as_millis(),"reason":reason}),
+                );
+            } else {
+                terminal = Some(json!({"status":"success","duration_ms":t.elapsed().as_millis()}));
+                contents.extend(r["content"].as_array().unwrap().clone());
+            }
         }
     }
-    contents.insert(0,text(json!({"sequence_summary":{"submitted":actions.len(),"executed":executed,"succeeded":succeeded,"guidance":if failed{"Take a screenshot before retrying."}else{""}},"action_results":rows,"terminal_screenshot":terminal}).to_string()));
-    json!({"content":contents,"isError":failed})
+    let mut summary = json!({"submitted":actions.len(),"executed":executed,"succeeded":succeeded,"guidance":if stop.is_some(){"Take a screenshot before retrying."}else{""}});
+    if let Some(reason) = &stop {
+        summary["stop_reason"] = json!(reason);
+        summary["stopped_at_index"] = json!(stopped_at);
+    }
+    let mut body = json!({"sequence_summary":summary,"action_results":rows});
+    if let Some(terminal) = terminal {
+        body["terminal_screenshot"] = terminal;
+    }
+    contents.insert(0, text(body.to_string()));
+    json!({"content":contents,"isError":stop.is_some()})
 }
 
 #[cfg(test)]
@@ -550,12 +645,12 @@ mod sequence_tests {
         )
         .await;
         assert_eq!(response["isError"], true);
-        assert!(response["content"][1]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("CLIENT_ERROR:"));
         let body: Value =
             serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(body["sequence_summary"]["stop_reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("CLIENT_ERROR: Rejected before dispatch:"));
         assert_eq!(body["sequence_summary"]["stopped_at_index"], index);
         assert_eq!(body["sequence_summary"]["executed"], 0);
         assert_eq!(platform.geometry_calls.load(Ordering::SeqCst), captures);
@@ -587,7 +682,7 @@ mod sequence_tests {
         assert_rejected(json!([{"type":"left_click","x":0,"y":0}, {"type":"type_text","text":"a".repeat(6000)}, {"type":"type_text","text":"b".repeat(5000)}, {"type":"key","keys":"a"}]), 2, 0).await;
         assert_rejected(
             json!(vec![json!({"type":"left_click","x":0,"y":0}); 21]),
-            0,
+            20,
             0,
         )
         .await;

@@ -4,6 +4,11 @@ pub const EVENT_DELAY: Duration = Duration::from_millis(5);
 pub trait Input {
     fn motion(&mut self, p: Point) -> Result<(), String>;
     fn button(&mut self, b: Button, down: bool, count: u8) -> Result<(), String>;
+    /// Native button events do not move the cursor. Backends requiring a location
+    /// must use the current cursor position for this cleanup operation.
+    fn release_left(&mut self) -> Result<(), String> {
+        self.button(Button::Left, false, 1)
+    }
     fn key(&mut self, k: Key, down: bool) -> Result<(), String>;
     fn scroll(&mut self, d: ScrollDirection, ticks: i64) -> Result<(), String>;
     fn text(&mut self, text: &str) -> Result<(), String>;
@@ -36,6 +41,7 @@ fn held(
 }
 pub fn perform(i: &mut dyn Input, op: Operation) -> Result<(), String> {
     match op {
+        Operation::ReleaseLeft => i.release_left(),
         Operation::Move(p) => i.motion(p),
         Operation::Click(p, b, n, mods) => {
             i.motion(p)?;

@@ -139,13 +139,16 @@ async fn rejections() {
         ),
         (
             vec![json!({"type":"screenshot"})],
-            "action 0: action cannot be nested or is unavailable".into(),
+            "action 0: screenshot cannot be nested in execute_sequence".into(),
         ),
     ] {
         let r = sequence(&json!({"actions":actions}), &c, p.clone()).await;
         assert_eq!(r["isError"], true);
         let body: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(body["sequence_summary"]["stop_reason"], expected);
+        assert_eq!(
+            body["sequence_summary"]["stop_reason"],
+            format!("CLIENT_ERROR: Rejected before dispatch: {expected}")
+        );
         assert_eq!(body["sequence_summary"]["executed"], 0);
         assert_eq!(
             body["action_results"][0]["reason"],
@@ -404,7 +407,7 @@ async fn native_sequence_rejects_outside_fresh_geometry_before_dispatch() {
     assert_eq!(body["sequence_summary"]["executed"], 0);
     assert_eq!(
         body["sequence_summary"]["stop_reason"],
-        "action 1: x outside screen bounds"
+        "CLIENT_ERROR: Rejected before dispatch: action 1: x outside screen bounds"
     );
     assert_eq!(p.geometry_calls(), 1);
     assert!(p.mock.calls.lock().unwrap().is_empty());

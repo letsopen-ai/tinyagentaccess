@@ -309,6 +309,18 @@ impl Platform for Mac {
     }
 }
 impl Input for Desktop {
+    fn release_left(&mut self) -> Result<(), String> {
+        unsafe {
+            let event = CGEventCreate(std::ptr::null_mut());
+            if event.is_null() {
+                return Err("CoreGraphics: could not query cursor position for release".into());
+            }
+            self.position = CGEventGetLocation(event);
+            CFRelease(event);
+        }
+        self.button(Button::Left, false, 1)
+    }
+
     fn motion(&mut self, p: Point) -> Result<(), String> {
         let d = unsafe { CGMainDisplayID() };
         let b = unsafe { CGDisplayBounds(d) };
