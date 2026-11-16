@@ -831,7 +831,7 @@ async fn modern_sequence_results_and_close_release() {
         if available {
             assert!(matches!(
                 p.operations.lock().unwrap().last().unwrap(),
-                taa_platform::Operation::Button(_, false, _)
+                taa_platform::Operation::ReleaseLeft
             ));
         }
         let r = value(
