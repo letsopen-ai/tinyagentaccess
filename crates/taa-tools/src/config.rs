@@ -34,6 +34,7 @@ pub struct Screenshots {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Replay {
+    pub max_bytes_per_session: Option<u64>,
     pub enabled: bool,
     pub save_dir: String,
 }

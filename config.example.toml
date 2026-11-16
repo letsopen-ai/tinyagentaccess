@@ -12,6 +12,7 @@ idle_timeout_secs = 780
 [screenshots]
 save_dir = "" # optional absolute private directory; returned images only (implemented in M3)
 [replay]
+# max_bytes_per_session = 104857600 # optional; unlimited by default. Stops frames; metadata/index continue.
 enabled = false # pre-action frames and metadata, local disk only; sensitive desktop contents
 save_dir = "" # required absolute private directory when enabled; no automatic retention cleanup
 [platform]

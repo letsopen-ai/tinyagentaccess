@@ -10,7 +10,10 @@ use axum::{
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use taa_platform::Platform;
@@ -19,6 +22,7 @@ pub const MODERN: &str = "2026-07-28";
 pub const STATEFUL: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
 pub use taa_tools::dialects::Interface;
 struct Session {
+    stopping: Arc<AtomicBool>,
     version: String,
     touched: Instant,
     active: usize,
@@ -100,10 +104,12 @@ impl Server {
         s.open.insert(
             id.clone(),
             Session {
+                stopping: Arc::default(),
                 replay: self.config.replay.enabled.then(|| {
-                    taa_tools::replay::Recorder::new(
+                    taa_tools::replay::Recorder::with_limit(
                         self.config.replay.save_dir.clone(),
                         id.clone(),
+                        self.config.replay.max_bytes_per_session,
                     )
                 }),
                 version: version.into(),
@@ -258,13 +264,39 @@ impl Platform for SessionPlatform {
         result
     }
 }
+struct StoppablePlatform {
+    inner: Arc<dyn Platform>,
+    stopping: Arc<AtomicBool>,
+}
+impl Platform for StoppablePlatform {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn screen_size(&self) -> (u32, u32) {
+        self.inner.screen_size()
+    }
+    fn capture_geometry(&self) -> Result<(u32, u32), String> {
+        self.inner.capture_geometry()
+    }
+    fn capture(&self) -> Result<taa_platform::Frame, String> {
+        self.inner.capture()
+    }
+    fn perform(&self, op: taa_platform::Operation) -> Result<(), String> {
+        self.inner.perform(op)
+    }
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+}
 // Drop also runs if the HTTP task is cancelled.
-struct ActiveSession(Arc<Server>, String);
+struct ActiveSession(Arc<Server>, String, bool);
 impl Drop for ActiveSession {
     fn drop(&mut self) {
         if let Some(v) = self.0.sessions.lock().unwrap().open.get_mut(&self.1) {
             v.active -= 1;
-            v.touched = Instant::now();
+            if self.2 {
+                v.touched = Instant::now();
+            }
         }
     }
 }
@@ -366,6 +398,8 @@ async fn delete(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
 // TINY-PROPOSAL (D-session): same-origin local polling, not DCV; no authentication.
 fn observer_allowed(s: &Server, h: &HeaderMap) -> bool {
     security(h, &s.config)
+        && local_host(authority_host(header(h, "host")))
+        && (!h.contains_key("sec-fetch-site") || header(h, "sec-fetch-site") == "same-origin")
         && (header(h, "origin").is_empty()
             || header(h, "origin") == format!("http://{}", header(h, "host")))
 }
@@ -424,7 +458,7 @@ async fn observe_latest(
             return StatusCode::NOT_FOUND.into_response();
         };
         session.active += 1;
-        ActiveSession(s.clone(), id.into())
+        ActiveSession(s.clone(), id.into(), false)
     };
     let image = taa_tools::execute("screenshot", &json!({}), &s.config, s.platform.clone()).await;
     ([("cache-control", "no-store")], Json(image)).into_response()
@@ -445,13 +479,15 @@ async fn observe_stop(
         return StatusCode::FORBIDDEN.into_response();
     }
     let id = id.as_str();
-    let _desktop = s.desktop.lock().await;
     {
         let sessions = s.sessions.lock().unwrap();
-        if !sessions.open.contains_key(id) && !sessions.closed.contains_key(id) {
+        if let Some(session) = sessions.open.get(id) {
+            session.stopping.store(true, Ordering::SeqCst);
+        } else if !sessions.closed.contains_key(id) {
             return StatusCode::NOT_FOUND.into_response();
         }
     }
+    let _desktop = s.desktop.lock().await;
     s.close_released(id).await;
     StatusCode::NO_CONTENT.into_response()
 }
@@ -778,7 +814,7 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                 sessions.open.get_mut(discovery_id).map(|session| {
                     session.active += 1;
                     session.touched = Instant::now();
-                    ActiveSession(s.clone(), discovery_id.to_owned())
+                    ActiveSession(s.clone(), discovery_id.to_owned(), true)
                 })
             };
             let mut r = taa_tools::dialects::list(interface, &s.config, modern);
@@ -906,9 +942,13 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             }
             // Admission and closure are atomic with respect to the session map.
             // The desktop lock prevents another tool close from overtaking admission.
-            let active = {
+            let (active, stopping) = {
                 let mut sessions = s.sessions.lock().unwrap();
-                let Some(session) = sessions.open.get_mut(&sid) else {
+                let Some(session) = sessions
+                    .open
+                    .get_mut(&sid)
+                    .filter(|v| !v.stopping.load(Ordering::SeqCst))
+                else {
                     return if modern {
                         modern_result(&id, client("Unknown mcpSessionId"), &sid)
                     } else {
@@ -916,12 +956,18 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                     };
                 };
                 session.active += 1;
-                ActiveSession(s.clone(), sid.clone())
+                (
+                    ActiveSession(s.clone(), sid.clone(), true),
+                    session.stopping.clone(),
+                )
             };
-            let platform: Arc<dyn Platform> = Arc::new(SessionPlatform {
-                inner: s.platform.clone(),
-                held: s.held.clone(),
-                owner: sid.clone(),
+            let platform: Arc<dyn Platform> = Arc::new(StoppablePlatform {
+                stopping,
+                inner: Arc::new(SessionPlatform {
+                    inner: s.platform.clone(),
+                    held: s.held.clone(),
+                    owner: sid.clone(),
+                }),
             });
             let replay = s
                 .sessions
@@ -1078,6 +1124,110 @@ mod tests {
         config.sessions.max_sessions = 2;
         let mock = Arc::new(taa_platform::MockPlatform::recording());
         (Server::new(config, mock.clone()), mock)
+    }
+    fn observer_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("host", "localhost".parse().unwrap());
+        h.insert("origin", "http://localhost".parse().unwrap());
+        h
+    }
+    #[tokio::test]
+    async fn observer_poll_does_not_refresh_idle_and_rejects_cross_site() {
+        let mut c = Config::default();
+        c.sessions.idle_timeout_secs = 1;
+        c.agent_access.user_control_mode = "view_only".into();
+        let s = Server::new(c, Arc::new(taa_platform::MockPlatform::recording()));
+        let sid = s.open(STATEFUL[2]).unwrap();
+        let touched = s.sessions.lock().unwrap().open[&sid].touched;
+        for _ in 0..3 {
+            assert_eq!(
+                observe_latest(State(s.clone()), observer_headers(), Path(sid.clone()))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(s.sessions.lock().unwrap().open[&sid].touched, touched);
+        }
+        s.sessions
+            .lock()
+            .unwrap()
+            .open
+            .get_mut(&sid)
+            .unwrap()
+            .touched = Instant::now() - Duration::from_secs(2);
+        assert_eq!(
+            observe_latest(State(s.clone()), observer_headers(), Path(sid.clone()))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let mut h = observer_headers();
+        h.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert_eq!(
+            observe_latest(State(s.clone()), h, Path(sid.clone()))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut h = observer_headers();
+        h.insert("host", "evil.example".parse().unwrap());
+        assert_eq!(
+            observe(State(s.clone()), h.clone()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            observe_sessions(State(s.clone()), h.clone()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            observe_latest(State(s.clone()), h.clone(), Path(sid.clone()))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            observe_stop(State(s), h, Path(sid)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    #[tokio::test]
+    async fn stop_interrupts_sequence_and_rejects_queued_call() {
+        let mut c = Config::default();
+        c.agent_access.user_control_mode = "view_stop".into();
+        let p = Arc::new(taa_platform::MockPlatform::recording());
+        let s = Server::new(c, p.clone());
+        let sid = s.open(STATEFUL[2]).unwrap();
+        let sequence = tokio::spawn(call(
+            s.clone(),
+            &sid,
+            "execute_sequence",
+            json!({"actions":[{"type":"wait","duration":0.2},{"type":"key","keys":"a"},{"type":"key","keys":"b"}]}),
+        ));
+        while s.sessions.lock().unwrap().open[&sid].active == 0 {
+            tokio::task::yield_now().await;
+        }
+        let queued = tokio::spawn(call(s.clone(), &sid, "key", json!({"keys":"c"})));
+        let stop = tokio::spawn(observe_stop(
+            State(s.clone()),
+            observer_headers(),
+            Path(sid.clone()),
+        ));
+        while !s.sessions.lock().unwrap().open[&sid]
+            .stopping
+            .load(Ordering::SeqCst)
+        {
+            tokio::task::yield_now().await;
+        }
+        let response = sequence.await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["result"]["isError"], true);
+        assert!(value.to_string().contains("Session stopped"));
+        assert_eq!(queued.await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(stop.await.unwrap().status(), StatusCode::NO_CONTENT);
+        assert!(p.operations.lock().unwrap().is_empty());
     }
     #[derive(Debug, PartialEq)]
     enum PointerEvent {

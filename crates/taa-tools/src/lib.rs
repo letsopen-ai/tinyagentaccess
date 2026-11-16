@@ -528,6 +528,10 @@ pub async fn sequence_recorded(
     // PROVISIONAL (not published by AWS): error/skipped statuses and failure guidance.
     for (i, a) in actions.iter().enumerate() {
         let n = short(a);
+        if stop.is_none() && p.is_stopping() {
+            stop = Some("Session stopped by observer".into());
+            stopped_at = Some(i);
+        }
         if stop.is_none() && Instant::now() >= deadline {
             stop = Some(format!("Deadline reached before action {i}"));
             stopped_at = Some(i);
@@ -576,6 +580,9 @@ pub async fn sequence_recorded(
     }
     let mut contents = vec![];
     let mut terminal = None;
+    if stop.is_none() && p.is_stopping() {
+        stop = Some("Session stopped by observer".into());
+    }
     if stop.is_none() {
         if actions.last().is_some_and(|a| short(a) != "wait") {
             tokio::time::sleep_until((Instant::now() + limits.stabilization).min(deadline)).await;

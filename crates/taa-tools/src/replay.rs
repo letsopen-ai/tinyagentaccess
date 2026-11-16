@@ -10,12 +10,15 @@ use std::{
 };
 
 pub struct Recorder {
+    max_bytes: Option<u64>,
     root: String,
     session: String,
     state: Mutex<ReplayState>,
 }
 #[derive(Default)]
 struct ReplayState {
+    frame_bytes: u64,
+    capped: bool,
     disk: Option<(PathBuf, File)>,
     seq: u64,
     pending: usize,
@@ -65,18 +68,17 @@ fn sanitize(v: &mut Value) {
                     .flat_map(char::to_lowercase)
                     .collect();
                 if [
-                    "password",
-                    "passwd",
                     "secret",
                     "token",
-                    "accesstoken",
-                    "refreshtoken",
+                    "password",
+                    "passwd",
                     "apikey",
-                    "authorization",
                     "credential",
-                    "credentials",
+                    "privatekey",
                 ]
-                .contains(&key.as_str())
+                .iter()
+                .any(|part| key.contains(part))
+                    || ["cookie", "authorization", "bearer"].contains(&key.as_str())
                 {
                     *value = json!("[omitted sensitive field]");
                 } else {
@@ -105,7 +107,11 @@ fn bounded(v: &Value) -> Value {
 }
 impl Recorder {
     pub fn new(root: String, session: String) -> Arc<Self> {
+        Self::with_limit(root, session, None)
+    }
+    pub fn with_limit(root: String, session: String, max_bytes: Option<u64>) -> Arc<Self> {
         Arc::new(Self {
+            max_bytes,
             root,
             session,
             state: Mutex::new(ReplayState::default()),
@@ -146,21 +152,7 @@ impl Recorder {
             }
             s.seq += 1;
             let mut meta = json!({"seq":s.seq,"timestamp_utc_epoch_ms":millis,"mcp_session_id":self.session,"tool":tool,"arguments":bounded(arguments),"native_action":native});
-            if let Some(block) = frame
-                .and_then(|f| f["content"].as_array())
-                .and_then(|b| b.iter().find(|b| b["type"] == "image"))
-            {
-                let ext = if block["mimeType"] == "image/jpeg" {
-                    "jpg"
-                } else {
-                    "png"
-                };
-                let name = format!("{}-{millis}.{ext}", s.seq);
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(block["data"].as_str().ok_or("missing frame data")?)?;
-                private_file(&s.disk.as_ref().unwrap().0.join(&name))?.write_all(&bytes)?;
-                meta["frame"] = json!(name);
-            }
+            self.save_frame(&mut s, &mut meta, frame, millis)?;
             let mut before = meta.clone();
             before["phase"] = json!("before");
             writeln!(s.disk.as_mut().unwrap().1, "{before}")?;
@@ -171,6 +163,52 @@ impl Recorder {
                 finished: false,
             })
         })())
+    }
+    fn save_frame(
+        &self,
+        s: &mut ReplayState,
+        meta: &mut Value,
+        frame: Option<&Value>,
+        millis: u128,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(block) = frame
+            .and_then(|f| f["content"].as_array())
+            .and_then(|b| b.iter().find(|b| b["type"] == "image"))
+        {
+            if s.capped {
+                return Ok(());
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(block["data"].as_str().ok_or("missing frame data")?)?;
+            if self.max_bytes.is_some_and(|limit| {
+                s.frame_bytes
+                    .saturating_add(
+                        s.disk
+                            .as_ref()
+                            .unwrap()
+                            .1
+                            .metadata()
+                            .map(|m| m.len())
+                            .unwrap_or(0),
+                    )
+                    .saturating_add(bytes.len() as u64)
+                    > limit
+            }) {
+                s.capped = true;
+                eprintln!("warning: replay frame byte limit reached; recording metadata only");
+                return Ok(());
+            }
+            let ext = if block["mimeType"] == "image/jpeg" {
+                "jpg"
+            } else {
+                "png"
+            };
+            let name = format!("{}-{millis}.{ext}", s.seq);
+            private_file(&s.disk.as_ref().unwrap().0.join(&name))?.write_all(&bytes)?;
+            s.frame_bytes += bytes.len() as u64;
+            meta["frame"] = json!(name);
+        }
+        Ok(())
     }
     pub fn end(&self) {
         let mut s = self.state.lock().unwrap();
@@ -186,6 +224,12 @@ impl Event {
         self.metadata["phase"] = json!("after");
         let mut s = self.recorder.state.lock().unwrap();
         warn((|| {
+            if self.metadata["native_action"] == "screenshot" {
+                let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+                self.recorder
+                    .save_frame(&mut s, &mut self.metadata, Some(response), millis)?;
+                self.metadata["frame_phase"] = json!("response");
+            }
             writeln!(s.disk.as_mut().unwrap().1, "{}", self.metadata)?;
             Ok(())
         })());
@@ -205,7 +249,7 @@ impl Drop for Event {
                 json!({"cancelled":true,"outcome":"unknown; admitted native work may finish"});
             let recorder = self.recorder.clone();
             let metadata = self.metadata.clone();
-            tokio::task::spawn_blocking(move || {
+            let write = move || {
                 let mut s = recorder.state.lock().unwrap();
                 warn((|| {
                     writeln!(s.disk.as_mut().unwrap().1, "{metadata}")?;
@@ -215,7 +259,12 @@ impl Drop for Event {
                 if s.ended && s.pending == 0 {
                     finalize(&mut s);
                 }
-            });
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(write);
+            } else {
+                write();
+            }
         }
     }
 }
@@ -233,11 +282,14 @@ fn finalize(s: &mut ReplayState) {
     warn((|| {
         log.flush()?;
         let mut index = private_file(&path.join("index.html"))?;
-        writeln!(index,"<!doctype html><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self'\"><title>Local replay</title><h1>TINY-PROPOSAL local replay index</h1><p>Local frames and metadata. Not an AWS/Bedrock evidence report. No video.</p>")?;
+        writeln!(index,"<!doctype html><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src 'self' file: data:\"><title>Local replay</title><h1>TINY-PROPOSAL local replay index</h1><p>Local frames and metadata. Not an AWS/Bedrock evidence report. No video.</p>")?;
         let mut reader = log.try_clone()?;
         reader.seek(SeekFrom::Start(0))?;
         for line in BufReader::new(reader).lines() {
-            let v: Value = serde_json::from_str(&line?)?;
+            let line = line?;
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if v["phase"] != "after" {
                 continue;
             }
@@ -249,7 +301,7 @@ fn finalize(s: &mut ReplayState) {
             if let Some(frame) = v["frame"].as_str() {
                 writeln!(
                     index,
-                    "<img alt=\"Pre-action frame\" src=\"{}\">",
+                    "<img alt=\"Replay frame\" src=\"{}\">",
                     escape(frame)
                 )?;
             }
@@ -267,7 +319,7 @@ impl Context {
         c: &crate::config::Config,
         p: Arc<dyn taa_platform::Platform>,
     ) -> Option<Event> {
-        let frame = if native == "wait" {
+        let frame = if matches!(native, "wait" | "screenshot") {
             None
         } else {
             Some(crate::execute("screenshot", &json!({}), c, p).await)

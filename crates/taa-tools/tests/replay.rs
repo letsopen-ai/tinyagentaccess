@@ -193,3 +193,109 @@ fn refuses_symlinks_and_unsafe_session_and_existing_files() {
         .begin("info", &json!({}), None, None)
         .is_none());
 }
+
+fn log_path(root: &Path) -> PathBuf {
+    files(root)
+        .into_iter()
+        .find(|p| p.ends_with("events.jsonl"))
+        .unwrap()
+}
+#[test]
+fn cancellation_sync_and_robust_escaped_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = context(tmp.path());
+    let event = ctx.recorder.begin("forwarded___pending", &json!({"text":"</pre><script>", "client_secret":"hidden", "x-api-key":"hidden", "sessionToken":"hidden", "Cookie":"hidden"}), None, None).unwrap();
+    let log = log_path(tmp.path());
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"partial malformed JSON\n")
+        .unwrap();
+    ctx.recorder.end();
+    assert!(!log.parent().unwrap().join("index.html").exists());
+    drop(event);
+    let rows = fs::read_to_string(&log).unwrap();
+    assert!(rows.contains("cancelled"));
+    assert!(!rows.contains("hidden"));
+    let index = fs::read_to_string(log.parent().unwrap().join("index.html")).unwrap();
+    assert!(index.contains("&lt;/pre&gt;&lt;script&gt;"));
+    assert!(!index.contains("</pre><script>"));
+    assert!(index.contains("img-src 'self' file: data:"));
+}
+#[tokio::test]
+async fn cancellation_async_completes_pending_finalization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = context(tmp.path());
+    let event = ctx
+        .recorder
+        .begin("forwarded___pending", &json!({}), None, None)
+        .unwrap();
+    let log = log_path(tmp.path());
+    ctx.recorder.end();
+    assert!(!log.parent().unwrap().join("index.html").exists());
+    drop(event);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !log.parent().unwrap().join("index.html").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(fs::read_to_string(log).unwrap().contains("cancelled"));
+}
+#[test]
+fn pending_forwarded_response_defers_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = context(tmp.path());
+    let event = ctx
+        .recorder
+        .begin("forwarded___pending", &json!({}), None, None)
+        .unwrap();
+    let log = log_path(tmp.path());
+    ctx.recorder.end();
+    assert!(!log.parent().unwrap().join("index.html").exists());
+    event.finish(&json!({"completed":true}));
+    assert!(fs::read_to_string(log.parent().unwrap().join("index.html"))
+        .unwrap()
+        .contains("completed"));
+}
+#[tokio::test]
+async fn screenshot_single_capture_and_frame_limit() {
+    for limit in [None, Some(0)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Context {
+            recorder: Recorder::with_limit(
+                tmp.path().to_str().unwrap().into(),
+                "session-1".into(),
+                limit,
+            ),
+            tool: "screenshot".into(),
+            arguments: json!({}),
+        };
+        let p = Arc::new(Ordered {
+            events: Mutex::new(vec![]),
+            fail: false,
+            root: tmp.path().into(),
+        });
+        let r = replay::execute(
+            "screenshot",
+            &json!({}),
+            &Config::default(),
+            p.clone(),
+            Some(&ctx),
+        )
+        .await;
+        assert_eq!(r["isError"], false);
+        assert_eq!(*p.events.lock().unwrap(), vec!["capture"]);
+        ctx.recorder.end();
+        let rows: Vec<Value> = fs::read_to_string(log_path(tmp.path()))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(rows[0].get("frame").is_none());
+        assert_eq!(rows[1]["frame"].is_string(), limit.is_none());
+    }
+}

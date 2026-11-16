@@ -269,7 +269,7 @@ Each following bullet is a separate **PROVISIONAL / TINY-PROPOSAL** local choice
   denied-unknown-key fields. Enabling requires a nonempty absolute path because no
   S3/KMS configuration applies. Replay is independent of returned screenshot saving.
 - **[D-evidence] Timing:** `replay::Context` captures the frame and writes a `before`
-  JSONL record immediately before native dispatch; `Event::finish` appends an `after`
+  JSONL record immediately before native dispatch (screenshot calls reuse the returned frame instead); `Event::finish` appends an `after`
   record with the same sequence and the response on success or error. A response
   cannot exist before dispatch; the paired-record policy is isolated for replacement.
   UTC timestamps use explicit Unix epoch milliseconds, not local wall time.
@@ -291,14 +291,15 @@ Each following bullet is a separate **PROVISIONAL / TINY-PROPOSAL** local choice
   capture. `get_session_info`, `close_session` and forwarded calls record metadata
   only; forwarding retains its independent admission and never takes the desktop lock.
   Initialize, list, raw HTTP frames and observer polls are not replay events.
+- **[D-evidence] Bounds:** optional `replay.max_bytes_per_session` defaults to unlimited. Before saving each frame, the recorder compares accumulated frame and JSONL bytes plus the new frame against the limit. Once exceeded, it logs one warning and saves metadata only. Metadata and final index remain uncapped, so this is a frame-storage budget rather than a hard total disk quota (TINY-PROPOSAL).
 - **[D-evidence] Bounds:** each argument/response JSON payload over 65,536 UTF-8
   bytes is replaced with an explicit truncation marker, original byte count and
   first 16,384 Unicode scalars (at most 65,536 bytes). Image-response base64 is omitted
-  because the pre-action image is a separate artifact. This limits opaque forwarded
+  because the image is a separate artifact. Screenshot calls have metadata-only before records and save their returned image on the after record, avoiding a second capture. This limits opaque forwarded
   payloads; desktop text and screenshots may contain sensitive information. No
   general redaction or retention deletion is promised; users own local cleanup.
 - **[D-evidence] Named secrets:** the local metadata sanitizer recursively omits common
-  password/token/API-key/authorization/credential fields before truncation, to avoid
+  fields whose normalized keys contain secret/token/password/passwd/apikey/credential/privatekey, plus exact cookie/authorization/bearer fields before truncation, to avoid
   retaining explicitly named secrets from forwarded tools. This is best effort;
   arbitrary text and desktop pixels are not redacted. AWS documents no redaction.
 - **[D-evidence] Finalization:** close_session, DELETE, idle expiry and observer Stop
@@ -315,12 +316,12 @@ Each following bullet is a separate **PROVISIONAL / TINY-PROPOSAL** local choice
   image JSON, and POST `/observe/stop/{id}` closes that ID. Polls are sequential at
   1.5 seconds after each completed request. This is local polling, not DCV or an
   AWS streaming URL. All sessions share the local desktop. Vision-disabled servers
-  reject image capture; observation uses normal capture/consent and pins active work.
+  reject image capture; observation uses normal capture/consent and pins active work without resetting the agent idle timer. Polls with Sec-Fetch-Site must say same-origin; any Origin must match.
 - **[D-session] Mode policy:** disabled routes return 404; view_only has no button
   and rejects Stop; view_stop allows Stop only for live or remembered closed IDs,
   returning 204 idempotently and 404 for unknown IDs. The shared release/close path
   releases held buttons, removes ownership/session state and tears down forwarding.
-  Stop waits for admitted desktop work, including an entire sequence, to finish;
+  PROVISIONAL: AWS VIEW_STOP mid-action semantics are unknown. Stop marks the session stopping before waiting for the desktop lock. Sequences abort with a stopped error between steps; an admitted native action or wait may finish. Queued calls fail;
   queued requests recheck existence and fail after closure. No local image-builder
   stop/start or OS logout exists. A new MCP session is required to resume.
 - **[D-session] Browser safety:** observer responses disable caching; the page denies

@@ -94,6 +94,7 @@ See the [local conversion choices](docs/design.md#m5-computer-use-dialect-adapte
 [replay]
 enabled = true
 save_dir = "/absolute/private/replay"
+# max_bytes_per_session = 104857600 # optional frame-storage budget; default unlimited
 
 [agent_access]
 user_control_mode = "view_stop" # disabled (default) | view_only | view_stop
@@ -110,14 +111,14 @@ there is no video, transcript, S3, KMS, or automatic retention deletion.
 Replay can contain sensitive screen/text/tool data; enable only in a private directory
 and remove it yourself. Unix creation modes are 0700/0600, Windows inherits ACLs;
 symlink sink directories and existing output files are refused. Failures warn without
-changing the tool result. Opaque metadata is capped (see [M7 choices](docs/design.md#m7-local-replay-and-human-control)).
+changing the tool result. The optional replay byte budget stops frame storage with one warning; metadata and the index continue and may exceed the budget. Opaque metadata is capped (see [M7 choices](docs/design.md#m7-local-replay-and-human-control)).
 
 Open `http://127.0.0.1:8765/observe` on the same origin as the server. `view_only`
 shows session selection and fresh screenshots; `view_stop` also shows Stop. `disabled`
 returns 404 for observer routes. All local sessions share one desktop; selection
 chooses which session to observe or close, not a separate OS desktop. Polling uses
 the normal capture path and may require OS consent. Stop releases held input and
-closes the selected MCP session after admitted desktop work finishes. Queued calls
+marks the session stopping immediately and closes it after the admitted action finishes. Sequences check Stop between steps (PROVISIONAL; AWS mid-action semantics unknown). Observation does not reset the idle timer. Queued calls
 then fail like calls after normal closure; the agent must create a new session.
 No `client_disconnected` notification is emitted: its AWS wire form is unknown.
 

@@ -47,6 +47,10 @@ pub enum Operation {
 }
 /// Implementations serialize their native connection internally; callers also serialize dispatch.
 pub trait Platform: Send + Sync {
+    fn is_stopping(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str;
     /// Cached physical dimensions; must never prompt or wait for consent.
     fn screen_size(&self) -> (u32, u32);
