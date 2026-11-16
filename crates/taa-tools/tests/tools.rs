@@ -224,3 +224,103 @@ async fn typed_mapping_and_encoding() {
         &Operation::Click(Point { x: 1919, y: 1079 }, Button::Left, 1, vec![])
     );
 }
+
+#[tokio::test]
+async fn safety_preflight_and_unicode_policy() {
+    let p = Arc::new(MockPlatform::recording());
+    let c = Config::default();
+    for amount in [i64::MIN, i64::MAX, 12001, -12001] {
+        let args = json!({"x":0,"y":0,"scroll_direction":"Up","scroll_amount":amount});
+        let r = execute("scroll", &args, &c, p.clone()).await;
+        assert!(
+            r["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("CLIENT_ERROR:"),
+            "{r}"
+        );
+        let r = sequence(&json!({"actions":[{"type":"scroll","x":0,"y":0,"scroll_direction":"Up","scroll_amount":amount}]}),&c,p.clone()).await;
+        assert_eq!(r["isError"], true);
+    }
+    for t in ["\0", "\u{8}", "\u{7f}", "\u{85}", "\u{9f}"] {
+        assert_eq!(
+            execute("type_text", &json!({"text":t}), &c, p.clone()).await["isError"],
+            true
+        );
+    }
+    assert!(p.calls.lock().unwrap().is_empty());
+    let t = "中😀e\u{301}\r\nA\rB\tC";
+    assert_eq!(
+        execute("type_text", &json!({"text":t}), &c, p.clone()).await["isError"],
+        false
+    );
+    assert_eq!(
+        p.operations.lock().unwrap()[0],
+        taa_platform::Operation::Text("中😀e\u{301}\nA\nB\tC".into())
+    );
+    for amount in [-12000, 0, 12000] {
+        assert!(validate(
+            "scroll",
+            &json!({"x":0,"y":0,"scroll_direction":"Up","scroll_amount":amount}),
+            (1280, 720)
+        )
+        .is_ok());
+    }
+}
+
+#[tokio::test]
+async fn letterbox_jpeg_and_cursor_through_execute() {
+    use base64::Engine;
+    use taa_platform::{
+        pixels::{arrow, decode_png, Frame, Point},
+        Operation, Platform,
+    };
+    struct Synthetic;
+    impl Platform for Synthetic {
+        fn name(&self) -> &str {
+            "synthetic"
+        }
+        fn screen_size(&self) -> (u32, u32) {
+            (1600, 1200)
+        }
+        fn capture(&self) -> Result<Frame, String> {
+            let mut f = Frame::solid(1600, 1200, [200, 100, 50, 255]);
+            f.cursor = Some(arrow(Point { x: 800, y: 600 }));
+            Ok(f)
+        }
+        fn perform(&self, _: Operation) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let p: Arc<dyn Platform> = Arc::new(Synthetic);
+    let mut c = Config::default();
+    let mut frames = vec![];
+    for include in [false, true] {
+        let r = execute(
+            "screenshot",
+            &json!({"include_cursor":include}),
+            &c,
+            p.clone(),
+        )
+        .await;
+        assert_eq!(r["isError"], false);
+        let b = base64::engine::general_purpose::STANDARD
+            .decode(r["content"][0]["data"].as_str().unwrap())
+            .unwrap();
+        frames.push(decode_png(&b).unwrap());
+    }
+    assert_eq!(&frames[0].rgba[..4], &[0, 0, 0, 255]);
+    assert_eq!(
+        &frames[0].rgba[(360 * 1280 + 640) * 4..][..4],
+        &[200, 100, 50, 255]
+    );
+    assert_ne!(frames[0].rgba, frames[1].rgba);
+    c.agent_access.screen_image_format = "jpeg".into();
+    let r = execute("screenshot", &json!({}), &c, p).await;
+    assert_eq!(r["isError"], false);
+    assert_eq!(r["content"][0]["mimeType"], "image/jpeg");
+    let b = base64::engine::general_purpose::STANDARD
+        .decode(r["content"][0]["data"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(&b[..2], &[0xff, 0xd8]);
+}

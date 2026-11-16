@@ -4,16 +4,19 @@ pub struct Key(pub u32);
 pub type KeyCombo = Vec<Key>;
 impl Key {
     pub fn modifier(self) -> bool {
-        matches!(self.0, 0xffe1 | 0xffe3 | 0xffe9 | 0xffeb | 0x1008ff2b)
+        matches!(self.0, 0xffe1 | 0xffe3 | 0xffe9 | 0xffeb | 0x11000000)
     }
     pub fn parse(name: &str) -> Result<Self, String> {
+        if name.is_empty() {
+            return Err("empty key segment in combination".into());
+        }
         let lower = name.to_ascii_lowercase();
         let sym = match lower.as_str() {
             "ctrl" | "control" => 0xffe3,
             "shift" => 0xffe1,
             "alt" | "option" => 0xffe9,
             "cmd" | "command" | "super" | "meta" | "win" | "windows" => 0xffeb,
-            "fn" => 0x1008ff2b,
+            "fn" => 0x11000000,
             "enter" | "return" => 0xff0d,
             "tab" => 0xff09,
             "esc" | "escape" => 0xff1b,
@@ -126,6 +129,78 @@ pub fn combo(s: &str, modifiers_only: bool) -> Result<KeyCombo, String> {
     }
     Ok(out)
 }
+/// Canonical named vocabulary, shared by backend mapping audits.
+pub const SPECIAL_NAMES: &[&str] = &[
+    "ctrl",
+    "shift",
+    "alt",
+    "super",
+    "fn",
+    "enter",
+    "tab",
+    "esc",
+    "space",
+    "backspace",
+    "delete",
+    "insert",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "left",
+    "up",
+    "right",
+    "down",
+    "capslock",
+    "numlock",
+    "scrolllock",
+    "printscreen",
+    "pause",
+    "menu",
+    "volumeup",
+    "volumedown",
+    "mute",
+    "play",
+    "kp_space",
+    "kp_tab",
+    "kp_f1",
+    "kp_f2",
+    "kp_f3",
+    "kp_f4",
+    "kp_separator",
+    "kp_enter",
+    "kp_add",
+    "kp_subtract",
+    "kp_multiply",
+    "kp_divide",
+    "kp_decimal",
+    "kp_equal",
+    "kp_home",
+    "kp_left",
+    "kp_up",
+    "kp_right",
+    "kp_down",
+    "kp_prior",
+    "kp_next",
+    "kp_end",
+    "kp_begin",
+    "kp_insert",
+    "kp_delete",
+];
+/// Human-readable names for unavailable special mappings.
+pub fn label(k: Key) -> String {
+    if let Some(name) = SPECIAL_NAMES
+        .iter()
+        .find(|name| Key::parse(name).ok() == Some(k))
+    {
+        return (*name).into();
+    }
+    if (0xffbe..=0xffd5).contains(&k.0) {
+        return format!("F{}", k.0 - 0xffbd);
+    }
+    format!("keysym {:#x}", k.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +219,10 @@ mod tests {
         assert_eq!(combo("+", false).unwrap(), vec![Key(43)]);
         assert!(combo("ctrl+bogus", false).unwrap_err().contains("bogus"));
         assert!(combo("a", true).is_err());
+        for s in ["ctrl++a", "++"] {
+            assert!(combo(s, false).unwrap_err().contains("empty key segment"));
+        }
+        assert_ne!(Key::parse("fn").unwrap(), Key(0x1008ff2b));
         for i in 1..=24 {
             assert_eq!(Key::parse(&format!("F{i}")).unwrap(), Key(0xffbd + i));
         }

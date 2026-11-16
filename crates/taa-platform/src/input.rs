@@ -43,7 +43,9 @@ pub fn perform(i: &mut dyn Input, op: Operation) -> Result<(), String> {
                 for count in 1..=n {
                     let down = i.button(b, true, count);
                     let r = down.and(i.button(b, false, count));
-                    sleep(Duration::from_millis(60));
+                    if count < n {
+                        sleep(Duration::from_millis(60));
+                    }
                     r?;
                 }
                 Ok(())
@@ -55,7 +57,11 @@ pub fn perform(i: &mut dyn Input, op: Operation) -> Result<(), String> {
         }
         Operation::Drag(a, b) => {
             i.motion(a)?;
-            i.button(Button::Left, true, 1)?;
+            if let Err(e) = i.button(Button::Left, true, 1) {
+                let _ = i.button(Button::Left, false, 1);
+                return Err(e);
+            }
+            sleep(EVENT_DELAY);
             let moves = (|| {
                 for step in 1..=12 {
                     i.motion(Point {
@@ -70,6 +76,9 @@ pub fn perform(i: &mut dyn Input, op: Operation) -> Result<(), String> {
             moves.and(release)
         }
         Operation::Scroll(p, d, t, mods) => {
+            if t.unsigned_abs() > crate::MAX_SCROLL_TICKS as u64 {
+                return Err("scroll amount exceeds safety limit".into());
+            }
             i.motion(p)?;
             held(i, &mods, |i| i.scroll(d, t))
         }

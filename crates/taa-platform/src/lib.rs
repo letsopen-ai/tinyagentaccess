@@ -3,6 +3,8 @@ mod input;
 pub mod keys;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod macos_keys;
 pub mod pixels;
 #[cfg(target_os = "linux")]
 mod wayland;
@@ -12,11 +14,9 @@ mod windows;
 pub mod x11;
 pub use keys::{Key, KeyCombo};
 pub use pixels::{Frame, Point};
+#[cfg(any(test, feature = "test-support"))]
 use serde_json::{json, Value};
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
     Left,
@@ -51,6 +51,8 @@ pub trait Platform: Send + Sync {
     }
     fn perform(&self, op: Operation) -> Result<(), String>;
 }
+/// Local safety cap: at most 100 discrete notches per operation.
+pub const MAX_SCROLL_TICKS: i64 = 12_000;
 pub fn notches(ticks: i64) -> u32 {
     ((ticks.max(1) as u64 + 60) / 120)
         .max(1)
@@ -107,66 +109,73 @@ impl Platform for NoDisplay {
         self.capture().map(|_| ())
     }
 }
-#[derive(Default)]
-pub struct MockPlatform {
-    pub calls: Mutex<Vec<(String, Value)>>,
-    pub operations: Mutex<Vec<Operation>>,
-    pub available: bool,
-}
-pub type UnavailablePlatform = MockPlatform;
-impl MockPlatform {
-    pub fn recording() -> Self {
-        Self {
-            available: true,
-            ..Self::default()
+#[cfg(any(test, feature = "test-support"))]
+mod mock {
+    use super::*;
+    use std::sync::Mutex;
+    #[derive(Default)]
+    pub struct MockPlatform {
+        pub calls: Mutex<Vec<(String, Value)>>,
+        pub operations: Mutex<Vec<Operation>>,
+        pub available: bool,
+    }
+    pub type UnavailablePlatform = MockPlatform;
+    impl MockPlatform {
+        pub fn recording() -> Self {
+            Self {
+                available: true,
+                ..Self::default()
+            }
+        }
+        fn record(&self, n: String, v: Value) -> Result<(), String> {
+            if !self.available {
+                return Err("desktop backend not available on this platform yet".into());
+            }
+            self.calls.lock().unwrap().push((n, v));
+            Ok(())
         }
     }
-    fn record(&self, n: String, v: Value) -> Result<(), String> {
-        if !self.available {
-            return Err("desktop backend not available on this platform yet".into());
+    impl Platform for MockPlatform {
+        fn name(&self) -> &str {
+            if self.available {
+                "mock"
+            } else {
+                "unavailable"
+            }
         }
-        self.calls.lock().unwrap().push((n, v));
-        Ok(())
+        fn screen_size(&self) -> (u32, u32) {
+            (1920, 1080)
+        }
+        fn capture(&self) -> Result<Frame, String> {
+            self.record("screenshot".into(), json!({}))?;
+            Ok(Frame::solid(1920, 1080, [40, 80, 120, 255]))
+        }
+        fn perform(&self, op: Operation) -> Result<(), String> {
+            let name = match &op {
+                Operation::Move(_) => "move_pointer".into(),
+                Operation::Click(_, b, n, _) => format!(
+                    "click:{}:{n}",
+                    match b {
+                        Button::Left => "left",
+                        Button::Middle => "middle",
+                        Button::Right => "right",
+                    }
+                ),
+                Operation::Button(_, true, _) => "left_mouse_down".into(),
+                Operation::Button(_, false, _) => "left_mouse_up".into(),
+                Operation::Drag(..) => "left_click_drag".into(),
+                Operation::Scroll(..) => "scroll".into(),
+                Operation::Key(_, d) => if d.is_zero() { "key" } else { "hold_key" }.into(),
+                Operation::Text(_) => "type_text".into(),
+            };
+            self.record(name, json!({}))?;
+            self.operations.lock().unwrap().push(op);
+            Ok(())
+        }
     }
 }
-impl Platform for MockPlatform {
-    fn name(&self) -> &str {
-        if self.available {
-            "mock"
-        } else {
-            "unavailable"
-        }
-    }
-    fn screen_size(&self) -> (u32, u32) {
-        (1920, 1080)
-    }
-    fn capture(&self) -> Result<Frame, String> {
-        self.record("screenshot".into(), json!({}))?;
-        Ok(Frame::solid(1920, 1080, [40, 80, 120, 255]))
-    }
-    fn perform(&self, op: Operation) -> Result<(), String> {
-        let name = match &op {
-            Operation::Move(_) => "move_pointer".into(),
-            Operation::Click(_, b, n, _) => format!(
-                "click:{}:{n}",
-                match b {
-                    Button::Left => "left",
-                    Button::Middle => "middle",
-                    Button::Right => "right",
-                }
-            ),
-            Operation::Button(_, true, _) => "left_mouse_down".into(),
-            Operation::Button(_, false, _) => "left_mouse_up".into(),
-            Operation::Drag(..) => "left_click_drag".into(),
-            Operation::Scroll(..) => "scroll".into(),
-            Operation::Key(_, d) => if d.is_zero() { "key" } else { "hold_key" }.into(),
-            Operation::Text(_) => "type_text".into(),
-        };
-        self.record(name, json!({}))?;
-        self.operations.lock().unwrap().push(op);
-        Ok(())
-    }
-}
+#[cfg(any(test, feature = "test-support"))]
+pub use mock::{MockPlatform, UnavailablePlatform};
 #[cfg(test)]
 mod tests {
     #[test]

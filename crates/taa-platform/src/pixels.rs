@@ -210,12 +210,26 @@ pub fn encode(frame: &Frame, jpeg: bool) -> Result<(Vec<u8>, &'static str), Stri
         Ok((bytes, "image/png"))
     }
 }
+fn png_error(error: png::DecodingError) -> String {
+    match error {
+        png::DecodingError::LimitsExceeded => {
+            "portal PNG exceeds the 256 MiB decoder resource limit".into()
+        }
+        other => format!("portal PNG decode failed: {other}"),
+    }
+}
 pub fn decode_png(bytes: &[u8]) -> Result<Frame, String> {
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_limits(png::Limits {
+        bytes: 256 * 1024 * 1024,
+    });
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut r = decoder.read_info().map_err(|e| e.to_string())?;
+    let mut r = decoder.read_info().map_err(png_error)?;
+    if u64::from(r.info().width) * u64::from(r.info().height) > 64 * 1024 * 1024 {
+        return Err("portal PNG exceeds 64 megapixel decoded image limit".into());
+    }
     let mut data = vec![0; r.output_buffer_size()];
-    let info = r.next_frame(&mut data).map_err(|e| e.to_string())?;
+    let info = r.next_frame(&mut data).map_err(png_error)?;
     let mut f = Frame::solid(info.width, info.height, [0, 0, 0, 255]);
     let channels = info.color_type.samples();
     for (p, q) in data[..info.buffer_size()]
@@ -259,8 +273,8 @@ mod tests {
                 assert!(n.x >= 0 && n.x < size.0 as i32 && n.y >= 0 && n.y < size.1 as i32);
                 let back = m.forward(n);
                 let (x, y, w, h) = m.viewport;
-                assert!((back.x - p.x.clamp(x as i32, (x + w - 1) as i32)).abs() <= 1);
-                assert!((back.y - p.y.clamp(y as i32, (y + h - 1) as i32)).abs() <= 1);
+                assert_eq!(back.x, p.x.clamp(x as i32, (x + w - 1) as i32));
+                assert_eq!(back.y, p.y.clamp(y as i32, (y + h - 1) as i32));
             }
             let m = Mapping::new(size, true);
             assert_eq!(
@@ -271,6 +285,8 @@ mod tests {
     }
     #[test]
     fn images() {
+        assert!(png_error(png::DecodingError::LimitsExceeded)
+            .contains("256 MiB decoder resource limit"));
         let mut f = Frame::solid(40, 30, [255, 0, 0, 255]);
         f.cursor = Some(arrow(Point { x: 39, y: 29 }));
         let out = render(f, false, true).unwrap();
@@ -290,18 +306,71 @@ mod tests {
     }
 }
 
+/// Current primary-display pixels to global logical coordinates, including its origin.
+pub fn desktop_point(
+    p: Point,
+    physical: (u32, u32),
+    logical: (f64, f64),
+    origin: (f64, f64),
+) -> (f64, f64) {
+    (
+        origin.0 + p.x as f64 * logical.0 / physical.0.max(1) as f64,
+        origin.1 + p.y as f64 * logical.1 / physical.1.max(1) as f64,
+    )
+}
 /// Physical capture pixels to OS logical input units; preserves fractional positions.
 pub fn logical_point(p: Point, physical: (u32, u32), logical: (u32, u32)) -> (f64, f64) {
-    (
-        p.x as f64 * logical.0 as f64 / physical.0.max(1) as f64,
-        p.y as f64 * logical.1 as f64 / physical.1.max(1) as f64,
-    )
+    desktop_point(p, physical, (logical.0 as f64, logical.1 as f64), (0., 0.))
 }
 #[cfg(test)]
 mod dpi_tests {
     use super::*;
     #[test]
     fn scales() {
+        assert_eq!(
+            desktop_point(
+                Point { x: 2879, y: 1799 },
+                (2880, 1800),
+                (1440., 900.),
+                (-1440., 100.)
+            ),
+            (-0.5, 999.5)
+        );
+        let edge = desktop_point(
+            Point { x: 2000, y: 1000 },
+            (2001, 1001),
+            (1600.8, 800.8),
+            (50., -800.8),
+        );
+        assert!((edge.0 - 1650.).abs() < 1e-9 && (edge.1 + 0.8).abs() < 1e-9);
+        assert_eq!(
+            desktop_point(
+                Point { x: 0, y: 0 },
+                (2001, 1001),
+                (1600.8, 800.8),
+                (50., -800.8)
+            ),
+            (50., -800.8)
+        );
+        // The same physical point uses the refreshed mode and primary origin.
+        assert_eq!(
+            desktop_point(
+                Point { x: 1200, y: 600 },
+                (2400, 1200),
+                (1200., 600.),
+                (0., 0.)
+            ),
+            (600., 300.)
+        );
+        assert_eq!(
+            desktop_point(
+                Point { x: 1200, y: 600 },
+                (2400, 1200),
+                (2400., 1200.),
+                (-2400., 0.)
+            ),
+            (-1200., 600.)
+        );
         for (physical, logical) in [
             ((2560, 1440), (1280, 720)),
             ((1600, 900), (1280, 720)),

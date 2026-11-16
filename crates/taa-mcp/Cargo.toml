@@ -2,6 +2,7 @@
 name = "taa-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
@@ -15,3 +16,7 @@ taa-platform .workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies.taa-platform]
+workspace = true
+features = ["test-support"]

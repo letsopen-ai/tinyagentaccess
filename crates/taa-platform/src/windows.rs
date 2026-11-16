@@ -31,10 +31,21 @@ impl Windows {
 fn failure() -> String {
     format!("Windows desktop: {}; run in an unlocked interactive desktop at the same integrity level as the target application",std::io::Error::last_os_error())
 }
-fn aware() {
+fn aware() -> Result<(), String> {
+    static INIT: std::sync::Once = std::sync::Once::new();
     unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        INIT.call_once(|| {
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        });
+        if AreDpiAwarenessContextsEqual(
+            GetThreadDpiAwarenessContext(),
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        ) == 0
+        {
+            return Err("Windows: PER_MONITOR_AWARE_V2 DPI context required; restart without a conflicting DPI override".into());
+        }
     }
+    Ok(())
 }
 fn send(input: INPUT) -> Result<(), String> {
     if unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) } == 1 {
@@ -64,13 +75,38 @@ fn keyboard(vk: u16, scan: u16, flags: u32) -> Result<(), String> {
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: vk,
-                wScan: scan,
-                dwFlags: flags,
+                wScan: if vk == 0 {
+                    scan
+                } else {
+                    unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16 }
+                },
+                dwFlags: flags | extended(vk),
                 time: 0,
                 dwExtraInfo: 0,
             },
         },
     })
+}
+fn extended(code: u16) -> u32 {
+    if matches!(
+        code,
+        VK_LEFT
+            | VK_RIGHT
+            | VK_UP
+            | VK_DOWN
+            | VK_HOME
+            | VK_END
+            | VK_PRIOR
+            | VK_NEXT
+            | VK_INSERT
+            | VK_DELETE
+            | VK_LWIN
+            | VK_APPS
+    ) {
+        KEYEVENTF_EXTENDEDKEY
+    } else {
+        0
+    }
 }
 fn vk(k: Key) -> Option<u16> {
     Some(match k.0 {
@@ -130,7 +166,10 @@ fn vk(k: Key) -> Option<u16> {
         _ => return None,
     })
 }
-struct Desktop;
+#[derive(Default)]
+struct Desktop {
+    pressed: std::collections::HashMap<u32, (u16, Vec<u16>)>,
+}
 impl Platform for Windows {
     fn name(&self) -> &str {
         "windows-sendinput-gdi"
@@ -144,7 +183,7 @@ impl Platform for Windows {
         }
     }
     fn capture_geometry(&self) -> Result<(u32, u32), String> {
-        aware();
+        aware()?;
         let (w, h) = unsafe {
             (
                 GetSystemMetrics(SM_CXSCREEN).max(1) as u32,
@@ -156,8 +195,8 @@ impl Platform for Windows {
         Ok((w, h))
     }
     fn capture(&self) -> Result<Frame, String> {
-        let _guard = self.lock.lock().map_err(|e| e.to_string())?;
-        aware();
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        aware()?;
         unsafe {
             let (w, h) = self.capture_geometry()?;
             let screen = GetDC(std::ptr::null_mut());
@@ -228,10 +267,46 @@ impl Platform for Windows {
         }
     }
     fn perform(&self, op: Operation) -> Result<(), String> {
-        let _guard = self.lock.lock().map_err(|e| e.to_string())?;
-        aware();
-        input::perform(&mut Desktop, op)
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        aware()?;
+        let mut desktop = Desktop::default();
+        let result = input::perform(&mut desktop, op);
+        let keys = desktop.pressed.keys().copied().collect::<Vec<_>>();
+        let mut cleanup = Ok(());
+        for key in keys {
+            let r = desktop.key(Key(key), false);
+            if cleanup.is_ok() {
+                cleanup = r;
+            }
+        }
+        result.and(cleanup)
     }
+}
+impl Desktop {
+    fn unheld_modifiers(&self, required: &[u16]) -> Vec<u16> {
+        required
+            .iter()
+            .copied()
+            .filter(|m| {
+                !self
+                    .pressed
+                    .values()
+                    .any(|(code, mods)| code == m || mods.contains(m))
+            })
+            .collect()
+    }
+}
+fn required_modifiers(v: i16) -> Vec<u16> {
+    [(0x100, VK_SHIFT), (0x200, VK_CONTROL), (0x400, VK_MENU)]
+        .into_iter()
+        .filter_map(|(bit, key)| (v & bit != 0).then_some(key))
+        .collect()
+}
+// SendInput partitions 0..65535 into physical pixel bins. Aim at each bin's
+// center, rather than its edge, to avoid one-pixel errors after quantization.
+fn normalize_axis(pixel: i32, origin: i32, extent: i32) -> i32 {
+    (((pixel as f64 - origin as f64 + 0.5) * 65536. / extent.max(1) as f64).floor() as i32)
+        .clamp(0, 65535)
 }
 impl Input for Desktop {
     fn motion(&mut self, p: Point) -> Result<(), String> {
@@ -241,8 +316,8 @@ impl Input for Desktop {
             let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             mouse(
-                ((p.x - x) as f64 * 65535. / (w - 1).max(1) as f64).round() as i32,
-                ((p.y - y) as f64 * 65535. / (h - 1).max(1) as f64).round() as i32,
+                normalize_axis(p.x, x, w),
+                normalize_axis(p.y, y, h),
                 0,
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
             )
@@ -264,10 +339,31 @@ impl Input for Desktop {
         )
     }
     fn key(&mut self, k: Key, down: bool) -> Result<(), String> {
-        let mut shift = false;
-        let code = if let Some(v) = vk(k) {
-            v
+        if !down {
+            if let Some((code, modifiers)) = self.pressed.get(&k.0).cloned() {
+                let mut result = keyboard(code, 0, KEYEVENTF_KEYUP);
+                for m in modifiers.into_iter().rev() {
+                    let r = keyboard(m, 0, KEYEVENTF_KEYUP);
+                    if result.is_ok() {
+                        result = r;
+                    }
+                }
+                if result.is_ok() {
+                    self.pressed.remove(&k.0);
+                }
+                return result;
+            }
+            return Ok(());
+        }
+        let (code, required) = if let Some(v) = vk(k) {
+            (v, vec![])
         } else {
+            if k.0 >= 0xff00 && k.0 < 0x01000000 || k.0 >= 0x10000000 {
+                return Err(format!(
+                    "Windows: unsupported special key {}",
+                    crate::keys::label(k)
+                ));
+            }
             let c = char::from_u32(k.0 & 0x00ffffff).ok_or("Windows: invalid key")?;
             if c as u32 > 65535 {
                 return Err("Windows: use type_text for supplementary Unicode characters".into());
@@ -276,39 +372,21 @@ impl Input for Desktop {
             if v == -1 {
                 return Err(format!("Windows: key {c} unavailable; use type_text"));
             }
-            shift = v & 0x100 != 0;
-            (v & 255) as u16
+            ((v & 255) as u16, required_modifiers(v))
         };
-        if down && shift {
-            keyboard(VK_SHIFT, 0, 0)?;
+        let owned = self.unheld_modifiers(&required);
+        for (index, m) in owned.iter().enumerate() {
+            if let Err(e) = keyboard(*m, 0, 0) {
+                for m in owned[..=index].iter().rev() {
+                    let _ = keyboard(*m, 0, KEYEVENTF_KEYUP);
+                }
+                return Err(e);
+            }
         }
-        let flags = if down { 0 } else { KEYEVENTF_KEYUP };
-        let ext = if matches!(
-            code,
-            VK_LEFT
-                | VK_RIGHT
-                | VK_UP
-                | VK_DOWN
-                | VK_HOME
-                | VK_END
-                | VK_PRIOR
-                | VK_NEXT
-                | VK_INSERT
-                | VK_DELETE
-                | VK_LWIN
-                | VK_APPS
-        ) {
-            KEYEVENTF_EXTENDEDKEY
-        } else {
-            0
-        };
-        let r = keyboard(code, 0, flags | ext);
-        if !down && shift {
-            r.and(keyboard(VK_SHIFT, 0, KEYEVENTF_KEYUP))
-        } else {
-            r
-        }
+        self.pressed.insert(k.0, (code, owned));
+        keyboard(code, 0, 0)
     }
+
     fn scroll(&mut self, d: ScrollDirection, t: i64) -> Result<(), String> {
         let sign = if matches!(d, ScrollDirection::Down | ScrollDirection::Left) {
             -1i64
@@ -333,12 +411,12 @@ impl Input for Desktop {
         for c in t.chars() {
             if c == '\n' || c == '\t' {
                 let v = if c == '\n' { VK_RETURN } else { VK_TAB };
-                keyboard(v, 0, 0)?;
-                keyboard(v, 0, KEYEVENTF_KEYUP)?;
+                let down = keyboard(v, 0, 0);
+                down.and(keyboard(v, 0, KEYEVENTF_KEYUP))?;
             } else {
                 for unit in c.encode_utf16(&mut [0; 2]) {
-                    keyboard(0, *unit, KEYEVENTF_UNICODE)?;
-                    keyboard(0, *unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)?;
+                    let down = keyboard(0, *unit, KEYEVENTF_UNICODE);
+                    down.and(keyboard(0, *unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))?;
                 }
             }
             sleep(EVENT_DELAY);
@@ -350,13 +428,81 @@ impl Input for Desktop {
 mod tests {
     use super::*;
     #[test]
+    fn implicit_modifiers_preserve_explicit_and_shared_ownership() {
+        let mut d = Desktop::default();
+        d.pressed.insert(0xffe1, (VK_SHIFT, vec![]));
+        assert_eq!(
+            d.unheld_modifiers(&required_modifiers(0x741)),
+            vec![VK_CONTROL, VK_MENU]
+        );
+        d.pressed.insert(65, (65, vec![VK_CONTROL, VK_MENU]));
+        assert!(d.unheld_modifiers(&required_modifiers(0x741)).is_empty());
+        assert_eq!(extended(VK_LEFT), KEYEVENTF_EXTENDEDKEY);
+    }
+    #[test]
+    fn absolute_pixel_bins() {
+        for (origin, width) in [(-1920, 3840), (0, 1920), (0, 2560), (0, 3840)] {
+            for offset in [0, 1, width / 2, width - 2, width - 1] {
+                let n = normalize_axis(origin + offset, origin, width);
+                assert_eq!(n as i64 * width as i64 / 65536, offset as i64);
+            }
+        }
+    }
+    #[test]
+    fn named_mapping_audit() {
+        for name in crate::keys::SPECIAL_NAMES {
+            assert_eq!(
+                vk(Key::parse(name).unwrap()).is_some(),
+                *name != "fn",
+                "{name}"
+            );
+        }
+        for n in 1..=24 {
+            assert!(vk(Key::parse(&format!("F{n}")).unwrap()).is_some());
+        }
+        for n in 0..=9 {
+            assert!(vk(Key::parse(&format!("KP_{n}")).unwrap()).is_some());
+        }
+    }
+    #[test]
     fn tables() {
+        assert_eq!(
+            required_modifiers(0x741),
+            vec![VK_SHIFT, VK_CONTROL, VK_MENU]
+        );
+        assert_eq!(required_modifiers(0x641), vec![VK_CONTROL, VK_MENU]);
         assert_eq!(vk(Key(0xffbe)), Some(VK_F1));
         assert_eq!(vk(Key(0xffd5)), Some(VK_F24));
     }
     #[test]
     #[ignore = "requires unlocked Windows interactive desktop"]
     fn gui() {
-        Windows::default().capture().unwrap();
+        let p = Windows::default();
+        let frame = p.capture().unwrap();
+        aware().unwrap();
+        let mut original = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        assert_ne!(unsafe { GetCursorPos(&mut original) }, 0);
+        for point in [
+            Point { x: 0, y: 0 },
+            Point {
+                x: frame.width as i32 - 1,
+                y: frame.height as i32 - 1,
+            },
+            Point {
+                x: frame.width as i32 / 2,
+                y: frame.height as i32 / 2,
+            },
+        ] {
+            p.perform(Operation::Move(point)).unwrap();
+            sleep(std::time::Duration::from_millis(50));
+            let mut actual = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            assert_ne!(unsafe { GetCursorPos(&mut actual) }, 0);
+            assert_eq!((actual.x, actual.y), (point.x, point.y));
+        }
+        p.perform(Operation::Move(Point {
+            x: original.x,
+            y: original.y,
+        }))
+        .unwrap();
     }
 }

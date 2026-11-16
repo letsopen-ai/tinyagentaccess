@@ -20,12 +20,14 @@ use x11rb::{
 };
 #[derive(Default)]
 pub struct X11 {
+    display: Option<String>,
     state: Mutex<Option<Desktop>>,
     size: AtomicU64,
 }
 struct Desktop {
     held: std::collections::HashSet<u8>,
-    auto_shift: std::collections::HashSet<u32>,
+    pressed: std::collections::HashMap<u32, (u8, Option<u8>)>,
+    keymap: Option<GetKeyboardMappingReply>,
     conn: RustConnection,
     screen: usize,
     rect: (i16, i16, u16, u16),
@@ -33,20 +35,38 @@ struct Desktop {
 fn err(e: impl std::fmt::Display) -> String {
     format!("X11: {e}; check DISPLAY, Xauthority and that XTest is enabled")
 }
+fn mapping_stride(value: u8) -> Result<usize, String> {
+    if value == 0 {
+        Err("X11: empty keyboard mapping".into())
+    } else {
+        Ok(value as usize)
+    }
+}
+fn image_stride(width: u16, height: u16, bpp: u8, pad: u8, bytes: usize) -> Result<usize, String> {
+    if pad == 0 || !matches!(bpp, 8 | 16 | 24 | 32) {
+        return Err("X11: invalid pixel layout".into());
+    }
+    let stride = (width as usize * bpp as usize).div_ceil(pad as usize) * pad as usize / 8;
+    if bytes < stride * height as usize {
+        return Err("X11: truncated image reply".into());
+    }
+    Ok(stride)
+}
 impl X11 {
     pub fn connect(display: &str) -> Result<Self, String> {
         let (conn, screen) = x11rb::connect(Some(display)).map_err(err)?;
         let d = Desktop::new(conn, screen)?;
         let size = ((d.rect.2 as u64) << 32) | d.rect.3 as u64;
         Ok(Self {
+            display: Some(display.to_owned()),
             state: Mutex::new(Some(d)),
             size: AtomicU64::new(size),
         })
     }
     fn with<T>(&self, f: impl FnOnce(&mut Desktop) -> Result<T, String>) -> Result<T, String> {
-        let mut lock = self.state.lock().map_err(err)?;
+        let mut lock = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if lock.is_none() {
-            let (c, s) = x11rb::connect(None).map_err(err)?;
+            let (c, s) = x11rb::connect(self.display.as_deref()).map_err(err)?;
             *lock = Some(Desktop::new(c, s)?);
         }
         let d = lock.as_mut().unwrap();
@@ -55,7 +75,17 @@ impl X11 {
             ((d.rect.2 as u64) << 32) | d.rect.3 as u64,
             Ordering::Relaxed,
         );
-        f(d)
+        let result = f(d);
+        if result.is_err()
+            && d.conn
+                .get_input_focus()
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .is_none()
+        {
+            *lock = None;
+        }
+        result
     }
 }
 impl Desktop {
@@ -74,7 +104,8 @@ impl Desktop {
             screen,
             rect,
             held: Default::default(),
-            auto_shift: Default::default(),
+            pressed: Default::default(),
+            keymap: None,
         };
         d.refresh();
         Ok(d)
@@ -113,8 +144,14 @@ impl Desktop {
             .map_err(err)
     }
     fn keycode(&self, k: Key) -> Result<Option<(u8, bool)>, String> {
-        let map = self.mapping()?;
-        let stride = map.keysyms_per_keycode as usize;
+        let fetched;
+        let map = if let Some(map) = &self.keymap {
+            map
+        } else {
+            fetched = self.mapping()?;
+            &fetched
+        };
+        let stride = mapping_stride(map.keysyms_per_keycode)?;
         for (index, row) in map.keysyms.chunks(stride).enumerate() {
             if row.first() == Some(&k.0) {
                 return Ok(Some((self.conn.setup().min_keycode + index as u8, false)));
@@ -137,6 +174,7 @@ impl Desktop {
                 .map_err(err)?
                 .reply()
                 .map_err(err)?;
+            mapping_stride(old.keysyms_per_keycode)?;
             self.conn
                 .change_keyboard_mapping(
                     1,
@@ -148,18 +186,28 @@ impl Desktop {
                 .check()
                 .map_err(err)?;
             let r = (|| {
+                self.held.insert(code);
                 self.event(KEY_PRESS_EVENT, code, 0, 0)?;
                 self.event(KEY_RELEASE_EVENT, code, 0, 0)?;
-                sleep(EVENT_DELAY);
+                self.held.remove(&code);
+                self.conn
+                    .get_input_focus()
+                    .map_err(err)?
+                    .reply()
+                    .map_err(err)?;
+                sleep(std::time::Duration::from_millis(50));
                 Ok(())
             })();
+            // Release before restoring, even after a returned dispatch error.
+            let release = self.event(KEY_RELEASE_EVENT, code, 0, 0);
+            self.held.remove(&code);
             let restore = self
                 .conn
                 .change_keyboard_mapping(1, code, old.keysyms_per_keycode, &old.keysyms)
                 .map_err(err)?
                 .check()
                 .map_err(err);
-            r.and(restore)
+            r.and(release).and(restore)
         }
     }
 }
@@ -200,8 +248,13 @@ impl Platform for X11 {
                 .find(|v| v.visual_id == img.visual)
                 .ok_or("X11: unknown visual")?;
             let bpp = format.bits_per_pixel as usize;
-            let pad = format.scanline_pad as usize;
-            let stride = (w as usize * bpp).div_ceil(pad) * pad / 8;
+            let stride = image_stride(
+                w,
+                h,
+                format.bits_per_pixel,
+                format.scanline_pad,
+                img.data.len(),
+            )?;
             let mut f = Frame::solid(w as u32, h as u32, [0, 0, 0, 255]);
             for yy in 0..h as usize {
                 for xx in 0..w as usize {
@@ -258,7 +311,12 @@ impl Platform for X11 {
                 }
             }
             if f.cursor.is_none() {
-                if let Ok(c) = d.conn.query_pointer(d.root()).map_err(err)?.reply() {
+                if let Some(c) = d
+                    .conn
+                    .query_pointer(d.root())
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                {
                     f.cursor = Some(crate::pixels::arrow(Point {
                         x: c.root_x as i32 - x as i32,
                         y: c.root_y as i32 - y as i32,
@@ -269,7 +327,19 @@ impl Platform for X11 {
         })
     }
     fn perform(&self, op: Operation) -> Result<(), String> {
-        self.with(|d| input::perform(d, op))
+        self.with(|d| {
+            d.keymap = Some(d.mapping()?);
+            let mut result = input::perform(d, op);
+            for code in d.held.drain().collect::<Vec<_>>() {
+                let r = d.event(KEY_RELEASE_EVENT, code, 0, 0);
+                if result.is_ok() {
+                    result = r;
+                }
+            }
+            d.pressed.clear();
+            d.keymap = None;
+            result
+        })
     }
 }
 impl Input for Desktop {
@@ -298,38 +368,48 @@ impl Input for Desktop {
         )
     }
     fn key(&mut self, k: Key, down: bool) -> Result<(), String> {
-        let (code, shift) = self
-            .keycode(k)?
-            .ok_or_else(|| format!("X11: key {:#x} unavailable in current keymap", k.0))?;
-        let shift_code = self.keycode(Key(0xffe1))?.map(|p| p.0);
-        if down
-            && shift
-            && self.auto_shift.is_empty()
-            && shift_code.is_some_and(|s| !self.held.contains(&s))
-        {
-            self.event(KEY_PRESS_EVENT, shift_code.unwrap(), 0, 0)?;
-            self.auto_shift.insert(k.0);
+        if k.0 == 0x11000000 {
+            return Err("X11: unsupported special key fn".into());
         }
-        let result = self.event(
-            if down {
-                KEY_PRESS_EVENT
-            } else {
-                KEY_RELEASE_EVENT
-            },
-            code,
-            0,
-            0,
-        );
-        if down {
-            self.held.insert(code);
+        if !down {
+            if let Some((code, shift)) = self.pressed.remove(&k.0) {
+                let mut r = self.event(KEY_RELEASE_EVENT, code, 0, 0);
+                if r.is_ok() {
+                    self.held.remove(&code);
+                }
+                if let Some(code) = shift {
+                    let release = self.event(KEY_RELEASE_EVENT, code, 0, 0);
+                    if release.is_ok() {
+                        self.held.remove(&code);
+                    }
+                    if r.is_ok() {
+                        r = release;
+                    }
+                }
+                return r;
+            }
+            return Ok(());
+        }
+        let (code, shift) = self.keycode(k)?.ok_or_else(|| {
+            format!(
+                "X11: key {} unavailable in current keymap",
+                crate::keys::label(k)
+            )
+        })?;
+        let shift_code = if shift {
+            self.keycode(Key(0xffe1))?
+                .map(|p| p.0)
+                .filter(|s| !self.held.contains(s))
         } else {
-            self.held.remove(&code);
+            None
+        };
+        self.pressed.insert(k.0, (code, shift_code));
+        if let Some(s) = shift_code {
+            self.held.insert(s);
+            self.event(KEY_PRESS_EVENT, s, 0, 0)?;
         }
-        if !down && self.auto_shift.remove(&k.0) {
-            result.and(self.event(KEY_RELEASE_EVENT, shift_code.unwrap(), 0, 0))
-        } else {
-            result
-        }
+        self.held.insert(code);
+        self.event(KEY_PRESS_EVENT, code, 0, 0)
     }
 
     fn scroll(&mut self, d: ScrollDirection, t: i64) -> Result<(), String> {
@@ -369,5 +449,19 @@ impl Input for Desktop {
             sleep(EVENT_DELAY);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn malformed_server_layouts_are_errors() {
+        assert!(mapping_stride(0).is_err());
+        assert_eq!(mapping_stride(4).unwrap(), 4);
+        assert_eq!(image_stride(3, 2, 24, 32, 24).unwrap(), 12);
+        assert!(image_stride(3, 2, 24, 32, 23).is_err());
+        assert!(image_stride(3, 2, 24, 0, 24).is_err());
+        assert!(image_stride(3, 2, 64, 32, 48).is_err());
     }
 }

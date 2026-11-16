@@ -1,4 +1,5 @@
 //! CoreGraphics FFI: no Objective-C runtime or SDK build step required.
+use crate::macos_keys::ascii;
 use crate::{
     input::{self, Input, EVENT_DELAY},
     pixels::{Frame, Point},
@@ -32,8 +33,10 @@ struct CGRect {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGMainDisplayID() -> u32;
-    fn CGDisplayPixelsWide(d: u32) -> usize;
-    fn CGDisplayPixelsHigh(d: u32) -> usize;
+    fn CGDisplayCopyDisplayMode(d: u32) -> Ref;
+    fn CGDisplayModeGetPixelWidth(m: Ref) -> usize;
+    fn CGDisplayModeGetPixelHeight(m: Ref) -> usize;
+    fn CGDisplayModeRelease(m: Ref);
     fn CGDisplayBounds(d: u32) -> CGRect;
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGDisplayCreateImage(d: u32) -> Ref;
@@ -102,7 +105,7 @@ fn keycode(k: Key) -> Option<u16> {
         0xffe1 => 56,
         0xffe9 => 58,
         0xffeb => 55,
-        0x1008ff2b => 63,
+        0x11000000 => 63,
         0xff0d => 36,
         0xff09 => 48,
         0xff1b => 53,
@@ -149,9 +152,6 @@ fn keycode(k: Key) -> Option<u16> {
         0xffaf => 75,
         0xffae => 65,
         0xffbd => 81,
-        0x1008ff13 => 72,
-        0x1008ff11 => 73,
-        0x1008ff12 => 74,
         n @ 0xffb0..=0xffb9 => [82, 83, 84, 85, 86, 87, 88, 89, 91, 92][(n - 0xffb0) as usize],
         n @ 0xffbe..=0xffd1 => [
             122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80,
@@ -160,52 +160,24 @@ fn keycode(k: Key) -> Option<u16> {
         _ => return None,
     })
 }
-fn ascii(c: char) -> Option<(u16, bool)> {
-    let lower = c.to_ascii_lowercase();
-    let hardware = "asdfhgzxcv bqweryt123465=97-80]ou[ip";
-    if let Some(code) = hardware.chars().position(|x| x == lower) {
-        if code != 10 {
-            return Some((code as u16, c.is_ascii_uppercase()));
+fn physical_size(d: u32) -> Result<(u32, u32), String> {
+    unsafe {
+        let mode = CGDisplayCopyDisplayMode(d);
+        if mode.is_null() {
+            return Err("CoreGraphics: no current display mode".into());
         }
+        let size = (
+            CGDisplayModeGetPixelWidth(mode) as u32,
+            CGDisplayModeGetPixelHeight(mode) as u32,
+        );
+        CGDisplayModeRelease(mode);
+        if size.0 == 0 || size.1 == 0 {
+            return Err("CoreGraphics: invalid physical display dimensions".into());
+        }
+        Ok(size)
     }
-    let p = match c {
-        ' ' => (49, false),
-        '\'' => (39, false),
-        '"' => (39, true),
-        ';' => (41, false),
-        ':' => (41, true),
-        '\\' => (42, false),
-        '|' => (42, true),
-        ',' => (43, false),
-        '<' => (43, true),
-        '/' => (44, false),
-        '?' => (44, true),
-        'n' => (45, false),
-        'm' => (46, false),
-        '.' => (47, false),
-        '>' => (47, true),
-        '`' => (50, false),
-        '~' => (50, true),
-        '+' => (24, true),
-        '_' => (27, true),
-        '!' => (18, true),
-        '@' => (19, true),
-        '#' => (20, true),
-        '$' => (21, true),
-        '%' => (23, true),
-        '^' => (22, true),
-        '&' => (26, true),
-        '*' => (28, true),
-        '(' => (25, true),
-        ')' => (29, true),
-        '{' => (33, true),
-        '}' => (30, true),
-        _ => return None,
-    };
-    Some(p)
 }
 struct Desktop {
-    scale: f64,
     position: CGPoint,
     flags: u64,
     left_down: bool,
@@ -215,7 +187,6 @@ impl Desktop {
         unsafe {
             let d = CGMainDisplayID();
             let b = CGDisplayBounds(d);
-            let scale = CGDisplayPixelsWide(d) as f64 / b.size.width;
             let e = CGEventCreate(std::ptr::null_mut());
             let position = if e.is_null() {
                 b.origin
@@ -225,7 +196,6 @@ impl Desktop {
                 p
             };
             Self {
-                scale,
                 position,
                 flags: 0,
                 left_down: false,
@@ -258,14 +228,14 @@ impl Platform for Mac {
     fn capture_geometry(&self) -> Result<(u32, u32), String> {
         let (w, h) = unsafe {
             let d = CGMainDisplayID();
-            (CGDisplayPixelsWide(d) as u32, CGDisplayPixelsHigh(d) as u32)
+            physical_size(d)?
         };
         self.size
             .store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
         Ok((w, h))
     }
     fn capture(&self) -> Result<Frame, String> {
-        let _guard = self.lock.lock().map_err(|e| e.to_string())?;
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             if !CGPreflightScreenCaptureAccess() {
                 return Err(permission(true));
@@ -275,9 +245,14 @@ impl Platform for Mac {
             if image.is_null() {
                 return Err("CoreGraphics capture failed; check Screen Recording permission and an unlocked desktop".into());
             }
-            let _ = self.capture_geometry()?;
             let w = CGImageGetWidth(image);
             let h = CGImageGetHeight(image);
+            if physical_size(d) != Ok((w as u32, h as u32)) {
+                CGImageRelease(image);
+                return Err("CoreGraphics: capture and current physical display mode disagree; retry after display changes settle".into());
+            }
+            self.size
+                .store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
             let mut f = Frame::solid(w as u32, h as u32, [0, 0, 0, 255]);
             let space = CGColorSpaceCreateDeviceRGB();
             let context =
@@ -318,17 +293,33 @@ impl Platform for Mac {
         if !unsafe { AXIsProcessTrusted() } {
             return Err(permission(false));
         }
-        let mut guard = self.lock.lock().map_err(|e| e.to_string())?;
+        let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(
+            op,
+            Operation::Move(_)
+                | Operation::Click(..)
+                | Operation::Button(..)
+                | Operation::Drag(..)
+                | Operation::Scroll(..)
+        ) && physical_size(unsafe { CGMainDisplayID() })? != self.screen_size()
+        {
+            return Err("CoreGraphics: display dimensions changed during pointer operation; retry from a new screenshot".into());
+        }
         input::perform(guard.get_or_insert_with(Desktop::new), op)
     }
 }
 impl Input for Desktop {
     fn motion(&mut self, p: Point) -> Result<(), String> {
-        let origin = unsafe { CGDisplayBounds(CGMainDisplayID()).origin };
-        self.position = CGPoint {
-            x: origin.x + p.x as f64 / self.scale,
-            y: origin.y + p.y as f64 / self.scale,
-        };
+        let d = unsafe { CGMainDisplayID() };
+        let b = unsafe { CGDisplayBounds(d) };
+        let (w, h) = physical_size(d)?;
+        let (x, y) = crate::pixels::desktop_point(
+            p,
+            (w, h),
+            (b.size.width, b.size.height),
+            (b.origin.x, b.origin.y),
+        );
+        self.position = CGPoint { x, y };
         self.mouse(if self.left_down { 6 } else { 5 }, 0, 0)
     }
     fn button(&mut self, b: Button, down: bool, count: u8) -> Result<(), String> {
@@ -340,10 +331,11 @@ impl Input for Desktop {
             (Button::Middle, true) => (25, 2),
             (Button::Middle, false) => (26, 2),
         };
+        self.mouse(kind, button, count)?;
         if b == Button::Left {
             self.left_down = down;
         }
-        self.mouse(kind, button, count)
+        Ok(())
     }
     fn key(&mut self, k: Key, down: bool) -> Result<(), String> {
         let flag = match k.0 {
@@ -351,7 +343,7 @@ impl Input for Desktop {
             0xffe1 => 1 << 17,
             0xffe9 => 1 << 19,
             0xffeb => 1 << 20,
-            0x1008ff2b => 1 << 23,
+            0x11000000 => 1 << 23,
             _ => 0,
         };
         if down {
@@ -362,6 +354,12 @@ impl Input for Desktop {
         let (code, shift) = if let Some(c) = keycode(k) {
             (c, false)
         } else {
+            if k.0 >= 0xff00 && k.0 < 0x01000000 || k.0 > 0x0100ffff {
+                return Err(format!(
+                    "macOS: unsupported special key {}",
+                    crate::keys::label(k)
+                ));
+            }
             let c = char::from_u32(k.0 & 0xffffff).ok_or("macOS: invalid character key")?;
             ascii(c)
                 .ok_or_else(|| format!("macOS: key {c} has no hardware keycode; use type_text"))?
@@ -398,8 +396,8 @@ impl Input for Desktop {
         for c in t.chars() {
             if c == '\n' || c == '\t' {
                 let k = if c == '\n' { Key(0xff0d) } else { Key(0xff09) };
-                self.key(k, true)?;
-                self.key(k, false)?;
+                let down = self.key(k, true);
+                down.and(self.key(k, false))?;
             } else {
                 let mut buf = [0; 2];
                 let units = c.encode_utf16(&mut buf);
@@ -422,14 +420,38 @@ impl Input for Desktop {
 mod tests {
     use super::*;
     #[test]
+    fn named_mapping_audit() {
+        for name in crate::keys::SPECIAL_NAMES {
+            let key = Key::parse(name).unwrap();
+            assert_eq!(
+                keycode(key).is_some(),
+                !matches!(*name, "volumeup" | "volumedown" | "mute" | "play"),
+                "{name}"
+            );
+        }
+        for n in 1..=24 {
+            assert_eq!(
+                keycode(Key::parse(&format!("F{n}")).unwrap()).is_some(),
+                n <= 20
+            );
+        }
+        for n in 0..=9 {
+            assert!(keycode(Key::parse(&format!("KP_{n}")).unwrap()).is_some());
+        }
+    }
+    #[test]
     fn tables() {
         assert_eq!(keycode(Key(0xffeb)), Some(55));
         assert_eq!(ascii('a'), Some((0, false)));
         assert_eq!(ascii('b'), Some((11, false)));
         assert_eq!(ascii('p'), Some((35, false)));
         assert_eq!(ascii('T'), Some((17, true)));
-        for c in 'a'..='z' {
-            assert!(ascii(c).is_some());
+        for c in ' '..='~' {
+            assert!(ascii(c).is_some(), "{c}");
+        }
+        for (c, code) in [('j', 38), ('k', 40), ('l', 37), ('n', 45), ('m', 46)] {
+            assert_eq!(ascii(c), Some((code, false)));
+            assert_eq!(ascii(c.to_ascii_uppercase()), Some((code, true)));
         }
         assert!(permission(true).contains("Screen Recording"));
     }

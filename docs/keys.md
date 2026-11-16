@@ -12,7 +12,7 @@ Modifier aliases:
 | alt | option | 58 | Alt_L (0xffe9) | MENU (0x12) |
 | shift | — | 56 | Shift_L (0xffe1) | SHIFT (0x10) |
 | super | cmd, command, meta, win, windows | 55 (⌘) | Super_L (0xffeb) | LWIN (0x5b) |
-| fn | — | 63 | 0x1008ff2b, if mapped | unavailable |
+| fn | — | 63 | unsupported (never XF86WakeUp) | unavailable |
 
 Special keys (numbers in the macOS column are CG hardware keycodes). X11/portal symbols retain standard X keysym values; aliases are resolved before the backend.
 
@@ -65,11 +65,13 @@ Cheap media support:
 
 | Name | Alias | macOS | X11 / portal keysym | Windows VK |
 |---|---|---|---|---|
-| volumeup | XF86AudioRaiseVolume | 72 | 0x1008ff13 | VOLUME_UP |
-| volumedown | XF86AudioLowerVolume | 73 | 0x1008ff11 | VOLUME_DOWN |
-| mute | XF86AudioMute | 74 | 0x1008ff12 | VOLUME_MUTE |
+| volumeup | XF86AudioRaiseVolume | unavailable | 0x1008ff13 | VOLUME_UP |
+| volumedown | XF86AudioLowerVolume | unavailable | 0x1008ff11 | VOLUME_DOWN |
+| mute | XF86AudioMute | unavailable | 0x1008ff12 | VOLUME_MUTE |
 | play | XF86AudioPlay | unavailable | 0x1008ff14 | MEDIA_PLAY_PAUSE |
 
 Single printable characters use their Unicode character keysym on X11/portals (Latin-1 directly; others `0x01000000 | codepoint`). Named punctuation aliases are plus, minus, equal, slash. X11 looks up the current keyboard mapping; Windows uses VkKeyScanW; macOS combos use US hardware positions, including shifted punctuation. Availability and keypad distinctions depend on the keyboard layout and NumLock. There is no arbitrary X keysym database: documented names above are supported, unknown names are rejected. On macOS F13/F14/F15/Clear are the conventional hardware approximations for PC-only keys, not an assertion of identical OS behavior.
 
-For arbitrary Unicode strings use **type_text**, not a character combo. It bypasses layout on macOS (CGEvent Unicode strings) and Windows (UTF-16 KEYEVENTF_UNICODE). X11 temporarily remaps the highest keycode for absent symbols, then restores it. This emits key events, so applications must interpret Unicode keysyms correctly. Wayland uses portal keysym notifications; support for non-keymap characters requires compositor validation. No clipboard data is read or written. Newline and tab generate Return and Tab. Events pause 5 ms between Unicode scalars; macOS chunks are one scalar (one/two UTF-16 units). Emoji, CJK and combining marks are counted as Unicode scalars for the 10,000-character limit, rather than bytes or graphemes.
+For arbitrary Unicode strings use **type_text**, not a character combo. It bypasses layout on macOS (CGEvent Unicode strings) and Windows (UTF-16 KEYEVENTF_UNICODE). X11 temporarily remaps the highest keycode for absent symbols, then restores it. This emits key events, so applications must interpret Unicode keysyms correctly. Wayland uses portal keysym notifications; support for non-keymap characters requires compositor validation. No clipboard data is read or written. CRLF becomes one LF; lone CR also becomes LF. Newline and tab generate Return and Tab. Other C0/C1 controls and DEL return CLIENT_ERROR before any text is dispatched; all other Unicode scalars retain the existing text behavior. Events pause 5 ms between Unicode scalars; macOS chunks are one scalar (one/two UTF-16 units). Emoji, CJK and combining marks are counted as Unicode scalars for the 10,000-character limit, rather than bytes or graphemes.
+
+Windows applies all Shift/Ctrl/Alt requirements from VkKeyScanW and preserves explicitly held combo modifiers. macOS media/volume keys return named unsupported-key errors because system-defined media events are not implemented. X11 remaps wait for a server round trip plus 50 ms before restoration; arbitrarily delayed clients and concurrent human keymap changes can still race this global mechanism.

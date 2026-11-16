@@ -77,7 +77,7 @@ pub fn schema(n: &str, modern: bool) -> Value {
     match n {
         "scroll" => {
             p["scroll_direction"] = json!({"type":"string","enum":["Up","Down","Left","Right"]});
-            p["scroll_amount"] = json!({"type":"integer"});
+            p["scroll_amount"] = json!({"type":"integer","minimum":-taa_platform::MAX_SCROLL_TICKS,"maximum":taa_platform::MAX_SCROLL_TICKS});
             required.extend(["scroll_direction".into(), "scroll_amount".into()]);
         } // [DOC] ticks, 120 per notch
         "wait" | "hold_key" => {
@@ -200,6 +200,16 @@ pub fn validate(n: &str, a: &Value, screen: (u32, u32)) -> Result<(), String> {
             }
         }
     }
+    if let Some(t) = a["text"].as_str() {
+        if t.chars()
+            .any(|c| c.is_control() && !matches!(c, '\r' | '\n' | '\t'))
+        {
+            return Err(
+                "text contains unsupported control characters; only CR, LF and Tab are allowed"
+                    .into(),
+            );
+        }
+    }
     if let Some(keys) = a["keys"].as_str() {
         taa_platform::keys::combo(keys, false)?;
     }
@@ -216,7 +226,15 @@ pub fn screen(c: &Config, p: &dyn Platform) -> (u32, u32) {
     }
 }
 pub async fn execute(n: &str, a: &Value, c: &Config, p: Arc<dyn Platform>) -> Value {
-    if let Err(e) = validate(n, a, screen(c, p.as_ref())) {
+    if let Err(e) = validate(
+        n,
+        a,
+        if c.agent_access.screen_resolution == "native" {
+            (i32::MAX as u32, i32::MAX as u32)
+        } else {
+            screen(c, p.as_ref())
+        },
+    ) {
         return client(e);
     }
     if n == "wait" {
@@ -295,7 +313,13 @@ fn execute_blocking(n: &str, a: &Value, c: &Config, p: &dyn Platform) -> Value {
             taa_platform::keys::combo(a["keys"].as_str().unwrap(), false).unwrap(),
             Duration::from_secs_f64(a["duration"].as_f64().unwrap_or(0.)),
         ),
-        "type_text" => Operation::Text(a["text"].as_str().unwrap().into()),
+        "type_text" => Operation::Text(
+            a["text"]
+                .as_str()
+                .unwrap()
+                .replace("\r\n", "\n")
+                .replace('\r', "\n"),
+        ),
         "left_click" | "double_click" | "triple_click" | "right_click" | "middle_click" => {
             Operation::Click(
                 point("x", "y"),
