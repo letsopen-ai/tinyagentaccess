@@ -584,9 +584,7 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             };
             let r = if !taa_tools::NAMES.contains(&n) || !taa_tools::visible(n, &s.config, modern) {
                 client("Unknown tool")
-            } else if let Err(e) =
-                taa_tools::validate(n, &args, taa_tools::screen(&s.config, s.platform.as_ref()))
-            {
+            } else if let Err(e) = taa_tools::validate_shape(n, &args) {
                 client(e)
             } else {
                 match n {
