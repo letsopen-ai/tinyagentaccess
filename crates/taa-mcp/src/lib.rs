@@ -649,6 +649,7 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
         None
     };
     let forwarded_call = method == "tools/call"
+        && s.config.agent_access.forward_mcp_tools
         && params["name"]
             .as_str()
             .is_some_and(|n| n.starts_with("forwarded___"));

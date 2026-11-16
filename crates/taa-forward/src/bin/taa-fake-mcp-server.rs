@@ -35,6 +35,13 @@ async fn main() {
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if let Some(path) = args
+            .iter()
+            .position(|s| s == "--request-file")
+            .and_then(|i| args.get(i + 1))
+        {
+            std::fs::write(path, v["method"].as_str().unwrap_or("")).unwrap();
+        }
         if v["method"] == "notifications/cancelled" {
             if let Some(path) = args
                 .iter()

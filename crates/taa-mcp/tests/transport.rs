@@ -1184,3 +1184,18 @@ async fn forwarding_idle_expiry_and_shutdown_reap_children() {
         server.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn disabled_forwarding_validates_interface_for_forwarded_name() {
+    let (_, _, body) = request(
+        &app(),
+        "POST",
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"forwarded___x___y"}}),
+        &[
+            ("mcp-protocol-version", MODERN),
+            ("x-amzn-agentaccess-computer-use-interface-id", "bad"),
+        ],
+    )
+    .await;
+    assert_eq!(value(&body)["error"]["code"], -32602);
+}

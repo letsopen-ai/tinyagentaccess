@@ -176,12 +176,16 @@ async fn teardown_reaps_child() {
 }
 #[tokio::test]
 async fn teardown_interrupts_hung_initialize() {
-    let (_dir, set) = fixture("slow-init", &["10"]);
+    let marker = tempfile::NamedTempFile::new().unwrap();
+    let (_dir, set) = fixture(
+        "slow-init",
+        &["10", "--request-file", marker.path().to_str().unwrap()],
+    );
     let listing = {
         let set = set.clone();
         tokio::spawn(async move { set.list().await })
     };
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_request(marker.path(), "initialize").await;
     set.teardown().await;
     assert!(listing.await.unwrap().is_empty());
 }
@@ -267,6 +271,124 @@ async fn teardown_kills_uncooperative_child() {
         .status()
         .unwrap()
         .success());
+    #[cfg(windows)]
+    assert!(!String::from_utf8_lossy(
+        &std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .unwrap()
+            .stdout
+    )
+    .contains("taa-fake"));
+}
+
+async fn wait_for_request(path: &std::path::Path, method: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if std::fs::read_to_string(path).unwrap_or_default() == method {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn healthy_calls_during_slow_discovery() {
+    for mode in ["slow-init", "slow-list"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let marker = dir.path().join("request");
+        let exe = env!("CARGO_BIN_EXE_taa-fake-mcp-server");
+        std::fs::write(
+            &path,
+            json!({"mcpServers":{
+                "healthy":{"command":exe,"args":["good"]},
+                "slow":{"command":exe,"args":[mode,"10","--request-file",marker]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let limits = Timeouts {
+            request: Duration::from_millis(500),
+            initialize: Duration::from_millis(500),
+            graceful: Duration::from_millis(100),
+            teardown: Duration::from_secs(1),
+        };
+        let set = ForwardingSet::new(path, limits);
+        assert_eq!(set.list().await.len(), 4);
+        std::fs::remove_file(&marker).unwrap();
+        let refresh = {
+            let set = set.clone();
+            tokio::spawn(async move { set.list().await })
+        };
+        wait_for_request(
+            &marker,
+            if mode == "slow-init" {
+                "initialize"
+            } else {
+                "tools/list"
+            },
+        )
+        .await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            set.call("forwarded___healthy___ping", json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["content"][0]["text"], "pong");
+        set.teardown().await;
+        assert!(refresh.await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn teardown_during_initialize_reaps_unpublished_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let marker = dir.path().join("request");
+    let pid_path = dir.path().join("pid");
+    std::fs::write(
+        &path,
+        json!({"mcpServers":{"slow":{
+            "command":env!("CARGO_BIN_EXE_taa-fake-mcp-server"),
+            "args":["slow-init","60","--pid-file",pid_path,"--request-file",marker]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let set = ForwardingSet::new(path, Timeouts::default());
+    let refresh = {
+        let set = set.clone();
+        tokio::spawn(async move { set.list().await })
+    };
+    wait_for_request(&marker, "initialize").await;
+    let pid = std::fs::read_to_string(pid_path).unwrap();
+    tokio::time::timeout(Duration::from_millis(500), set.teardown())
+        .await
+        .unwrap();
+    assert!(refresh.await.unwrap().is_empty());
+    assert!(set.list().await.is_empty());
+    #[cfg(unix)]
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     #[cfg(windows)]
     assert!(!String::from_utf8_lossy(
         &std::process::Command::new("tasklist")

@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
     sync::oneshot,
 };
@@ -159,7 +159,7 @@ struct Client {
     next: AtomicU64,
 }
 impl Client {
-    async fn spawn(spec: &ServerSpec, limits: Timeouts) -> Result<Arc<Self>, Failure> {
+    fn spawn(spec: &ServerSpec) -> Result<Arc<Self>, Failure> {
         // §8: command + args, inherited environment, stdio only; kill_on_drop backstop.
         let mut child = Command::new(&spec.command)
             .args(&spec.args)
@@ -204,7 +204,7 @@ impl Client {
                 // PROVISIONAL (not published by AWS): unsupported server requests get -32601; notifications ignored.
                 if message.get("method").is_some() {
                     if let Some(id) = message.get("id") {
-                        let _ = write(&stdin, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}})).await;
+                        let _ = write(&stdin, &alive, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}})).await;
                     }
                 } else if let Some(id) = message["id"].as_u64() {
                     if let Some(tx) = pending.lock().unwrap().remove(&id) {
@@ -223,6 +223,10 @@ impl Client {
             alive.store(false, Ordering::SeqCst);
             pending.lock().unwrap().clear();
         });
+        Ok(client)
+    }
+    async fn initialize(self: &Arc<Self>, limits: Timeouts) -> Result<(), Failure> {
+        let client = self;
         // PROVISIONAL (not published by AWS): offer 2025-06-18, accept known versions.
         let initialized = client.request("initialize", json!({"protocolVersion":"2025-06-18","clientInfo":{"name":"tinyAgentAccess","version":env!("CARGO_PKG_VERSION")},"capabilities":{}}), limits.initialize).await?;
         if ![
@@ -239,10 +243,11 @@ impl Client {
         }
         write(
             &client.stdin,
+            &client.alive,
             json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
         )
         .await?;
-        Ok(client)
+        Ok(())
     }
     async fn request(
         &self,
@@ -263,21 +268,25 @@ impl Client {
             }
         }
         let _remove = RemovePending(self.pending.clone(), id);
+        let mut written = false;
         let outcome = tokio::time::timeout(budget, async {
             write(
                 &self.stdin,
+                &self.alive,
                 json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
             )
             .await?;
+            written = true;
             rx.await.map_err(|_| Failure::Unavailable)?
         })
         .await;
-        self.pending.lock().unwrap().remove(&id);
         match outcome {
             Ok(v) => v,
             Err(_) => {
                 // §8: cancel a timed-out downstream request. Bound even a blocked pipe write.
-                let _ = tokio::time::timeout(Duration::from_millis(50), write(&self.stdin, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id,"reason":"timeout"}}))).await;
+                if written {
+                    let _ = tokio::time::timeout(Duration::from_millis(50), write(&self.stdin, &self.alive, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id,"reason":"timeout"}}))).await;
+                }
                 Err(Failure::Timeout)
             }
         }
@@ -298,24 +307,55 @@ impl Client {
         }
     }
 }
-async fn write(
-    stdin: &tokio::sync::Mutex<Option<ChildStdin>>,
+// An interrupted write poisons and closes the pipe before releasing the mutex.
+// No later frame (including cancellation) may follow a partial JSON line.
+async fn write<W: AsyncWrite + Unpin>(
+    stdin: &tokio::sync::Mutex<Option<W>>,
+    alive: &AtomicBool,
     value: Value,
 ) -> Result<(), Failure> {
     let mut stdin = stdin.lock().await;
-    let pipe = stdin.as_mut().ok_or(Failure::Unavailable)?;
+    if stdin.is_none() {
+        return Err(Failure::Unavailable);
+    }
+    struct FrameGuard<'a, W> {
+        pipe: &'a mut Option<W>,
+        alive: &'a AtomicBool,
+        complete: bool,
+    }
+    impl<W> Drop for FrameGuard<'_, W> {
+        fn drop(&mut self) {
+            if !self.complete {
+                self.alive.store(false, Ordering::SeqCst);
+                self.pipe.take();
+            }
+        }
+    }
+    let mut frame = FrameGuard {
+        pipe: &mut stdin,
+        alive,
+        complete: false,
+    };
     let mut bytes = serde_json::to_vec(&value).unwrap();
     bytes.push(b'\n');
-    pipe.write_all(&bytes)
+    frame
+        .pipe
+        .as_mut()
+        .unwrap()
+        .write_all(&bytes)
         .await
-        .map_err(|_| Failure::Unavailable)
+        .map_err(|_| Failure::Unavailable)?;
+    frame.complete = true;
+    Ok(())
 }
+#[derive(Clone)]
 struct Entry {
     spec: ServerSpec,
     client: Option<Arc<Client>>,
     manifest: Vec<Value>,
 }
 struct State {
+    discovering: Vec<Arc<Client>>,
     entries: Option<Vec<Entry>>,
     routes: HashMap<String, (usize, String)>,
 }
@@ -325,6 +365,8 @@ pub struct ForwardingSet {
     path: std::path::PathBuf,
     limits: Timeouts,
     state: tokio::sync::Mutex<State>,
+    refresh_lock: tokio::sync::Mutex<()>,
+    refresh_generation: AtomicU64,
     closed: AtomicBool,
     stop: tokio::sync::Notify,
 }
@@ -334,14 +376,17 @@ impl ForwardingSet {
             path: path.as_ref().into(),
             limits,
             state: tokio::sync::Mutex::new(State {
+                discovering: vec![],
                 entries: None,
                 routes: HashMap::new(),
             }),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            refresh_generation: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             stop: tokio::sync::Notify::new(),
         })
     }
-    async fn refresh(&self) -> Vec<Value> {
+    async fn refresh(&self, observed: Option<u64>) -> Vec<Value> {
         let stopped = self.stop.notified();
         tokio::pin!(stopped);
         stopped.as_mut().enable();
@@ -351,22 +396,38 @@ impl ForwardingSet {
         tokio::select! {
             biased;
             _ = stopped => vec![],
-            tools = self.refresh_inner() => tools,
+            tools = self.refresh_inner(observed) => tools,
         }
     }
-    async fn refresh_inner(&self) -> Vec<Value> {
-        let mut state = self.state.lock().await;
+    async fn refresh_inner(&self, observed: Option<u64>) -> Vec<Value> {
+        let _refresh = self.refresh_lock.lock().await;
+        // A concurrent completed refresh already retried this route miss.
+        if observed
+            .is_some_and(|generation| generation != self.refresh_generation.load(Ordering::SeqCst))
+        {
+            return vec![];
+        }
+        let (mut entries, abandoned) = {
+            let mut state = self.state.lock().await;
+            (
+                state.entries.clone(),
+                std::mem::take(&mut state.discovering),
+            )
+        };
+        for client in abandoned {
+            client.close(self.limits.graceful).await;
+        }
         if self.closed.load(Ordering::SeqCst) {
             return vec![];
         }
-        if state.entries.is_none() {
+        if entries.is_none() {
             let parsed = match tokio::fs::read(&self.path).await {
                 Ok(bytes) => parse_config(&bytes),
                 Err(e) => Err(e.to_string()),
             };
             // PROVISIONAL (not published by AWS): one config warning per session,
             // leaving native tools available and caching the failed load.
-            state.entries = Some(match parsed {
+            entries = Some(match parsed {
                 Ok(config) => {
                     for warning in config.warnings {
                         eprintln!("warning: {warning}");
@@ -390,7 +451,7 @@ impl ForwardingSet {
         let mut successful = std::collections::HashSet::new();
         let mut routes = HashMap::new();
         let mut tools = vec![];
-        for (index, entry) in state.entries.as_mut().unwrap().iter_mut().enumerate() {
+        for (index, entry) in entries.as_mut().unwrap().iter_mut().enumerate() {
             if entry
                 .client
                 .as_ref()
@@ -399,7 +460,32 @@ impl ForwardingSet {
                 if let Some(old) = entry.client.take() {
                     old.close(self.limits.graceful).await;
                 }
-                entry.client = match Client::spawn(&entry.spec, self.limits).await {
+                let spawned = match Client::spawn(&entry.spec) {
+                    Ok(client) => {
+                        let mut state = self.state.lock().await;
+                        if self.closed.load(Ordering::SeqCst) {
+                            drop(state);
+                            client.close(self.limits.graceful).await;
+                            return vec![];
+                        }
+                        state.discovering.push(client.clone());
+                        drop(state);
+                        let result = client.initialize(self.limits).await;
+                        if result.is_err() {
+                            client.close(self.limits.graceful).await;
+                        }
+                        if result.is_err() {
+                            self.state
+                                .lock()
+                                .await
+                                .discovering
+                                .retain(|c| !Arc::ptr_eq(c, &client));
+                        }
+                        result.map(|()| client)
+                    }
+                    Err(e) => Err(e),
+                };
+                entry.client = match spawned {
                     Ok(c) => Some(c),
                     Err(_) => {
                         eprintln!(
@@ -447,7 +533,7 @@ impl ForwardingSet {
         }
         // PROVISIONAL (not published by AWS): retain each latest successful manifest
         // for routing even when a later listing fails. Failed listings expose no tools.
-        for (index, entry) in state.entries.as_ref().unwrap().iter().enumerate() {
+        for (index, entry) in entries.as_ref().unwrap().iter().enumerate() {
             for mut tool in entry.manifest.clone() {
                 let Some(original) = tool["name"].as_str().map(str::to_owned) else {
                     continue;
@@ -468,18 +554,32 @@ impl ForwardingSet {
                 }
             }
         }
+        let mut state = self.state.lock().await;
+        if self.closed.load(Ordering::SeqCst) {
+            drop(state);
+            for entry in entries.unwrap_or_default() {
+                if let Some(client) = entry.client {
+                    client.close(self.limits.graceful).await;
+                }
+            }
+            return vec![];
+        }
+        state.discovering.clear();
+        state.entries = entries;
         state.routes = routes;
+        self.refresh_generation.fetch_add(1, Ordering::SeqCst);
         tools
     }
     pub async fn list(&self) -> Vec<Value> {
-        self.refresh().await
+        self.refresh(None).await
     }
     pub async fn call(&self, name: &str, args: Value) -> Value {
         if !args.is_object() {
             return failure_result("CLIENT_ERROR: arguments must be an object");
         }
+        let observed = self.refresh_generation.load(Ordering::SeqCst);
         if !self.state.lock().await.routes.contains_key(name) {
-            self.refresh().await;
+            self.refresh(Some(observed)).await;
         }
         let route = {
             let state = self.state.lock().await;
@@ -524,13 +624,21 @@ impl ForwardingSet {
         let work = async {
             let mut state = self.state.lock().await;
             let mut tasks = tokio::task::JoinSet::new();
-            for entry in state.entries.take().unwrap_or_default() {
-                if let Some(client) = entry.client {
-                    let grace = self.limits.graceful;
-                    tasks.spawn(async move { client.close(grace).await });
-                }
+            let mut clients = std::mem::take(&mut state.discovering);
+            clients.extend(
+                state
+                    .entries
+                    .take()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|e| e.client),
+            );
+            for client in clients {
+                let grace = self.limits.graceful;
+                tasks.spawn(async move { client.close(grace).await });
             }
             state.routes.clear();
+            drop(state);
             while tasks.join_next().await.is_some() {}
         };
         // §8: concurrent teardown within 15s, per-server 1s graceful close.
@@ -550,4 +658,51 @@ pub fn rpc_error(code: i64, message: &str) -> String {
 }
 fn failure_result(message: &str) -> Value {
     json!({"content":[{"type":"text","text":message}],"isError":true})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn route_misses_share_completed_refresh_but_lists_always_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let set = ForwardingSet::new(path, Timeouts::default());
+        let observed = set.refresh_generation.load(Ordering::SeqCst);
+        set.refresh(Some(observed)).await;
+        assert_eq!(set.refresh_generation.load(Ordering::SeqCst), observed + 1);
+        // Model a second miss that observed the same generation before waiting.
+        set.refresh(Some(observed)).await;
+        assert_eq!(set.refresh_generation.load(Ordering::SeqCst), observed + 1);
+        set.list().await;
+        assert_eq!(set.refresh_generation.load(Ordering::SeqCst), observed + 2);
+        set.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_frame_closes_pipe_before_next_write() {
+        let (pipe, mut reader) = tokio::io::duplex(64);
+        let stdin = tokio::sync::Mutex::new(Some(pipe));
+        let alive = AtomicBool::new(true);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            write(&stdin, &alive, json!({"payload":"x".repeat(4096)}))
+        )
+        .await
+        .is_err());
+        assert!(!alive.load(Ordering::SeqCst));
+        assert!(stdin.lock().await.is_none());
+        assert!(
+            write(&stdin, &alive, json!({"method":"notifications/cancelled"}))
+                .await
+                .is_err()
+        );
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert!(!bytes.contains(&b'\n'));
+    }
 }

@@ -163,7 +163,8 @@ Every local policy below is **PROVISIONAL (not published by AWS)**:
 - Each upstream list refreshes every server, follows nextCursor within one request
   budget, and rejects repeated cursors. Successful manifests replace that server's
   cached routing map; a failed refresh exposes no tools but preserves the last
-  successful map for calls. Unknown forwarded names trigger one refresh before
+  successful map for calls. Concurrent route misses share a completed refresh; explicit lists always re-list.
+  Unknown forwarded names trigger at most one refresh before
   CLIENT_ERROR Unknown tool. Collisions choose the first entry in config order and warn.
 - Exited children are unavailable to calls and respawn lazily at most once during
   each upstream listing. A refresh triggered by an unknown name counts as a listing.
@@ -179,3 +180,12 @@ Every local policy below is **PROVISIONAL (not published by AWS)**:
 The Rust fixture is a normal binary so Cargo provides CARGO_BIN_EXE to integration
 tests and SDK verification can reuse it without Python in cargo tests. taa-mcp builds
 the same source as a separately named fixture binary for transport tests.
+
+Forwarding refreshes are serialized by a dedicated refresh mutex. Discovery snapshots
+entries under the routing-state mutex, performs spawn/initialize/list outside it,
+and briefly reacquires it to publish. Cached healthy routes remain callable during
+discovery. Teardown marks the set closed and interrupts refreshes without waiting
+for discovery; children being initialized or listed are tracked separately so
+teardown can close and reap them before publication. Kill-on-drop remains a backstop. Interrupted downstream
+frame writes close the pipe and mark the client unavailable. Timeout cancellation
+is sent only after the complete request frame was written.
