@@ -225,11 +225,23 @@ fn compatible_geometry(physical: (u32, u32), logical: (u32, u32)) -> Result<(), 
 }
 impl Drop for Desktop {
     fn drop(&mut self) {
-        close(self);
-        if let Some(rt) = self.rt.take() {
-            rt.shutdown_background();
-        }
+        blocking_cleanup(|| {
+            close(self);
+            if let Some(rt) = self.rt.take() {
+                rt.shutdown_background();
+            }
+        });
     }
+}
+// Drop may run inside Tokio (including on CLI shutdown). Close the session and
+// dispose of its runtime on a thread where nested block_on is safe.
+fn blocking_cleanup(cleanup: impl FnOnce() + Send) {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(cleanup)
+            .join()
+            .expect("portal cleanup panicked");
+    });
 }
 impl Desktop {
     fn runtime(&self) -> &tokio::runtime::Runtime {
@@ -501,6 +513,29 @@ impl Input for Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn check_blocking_cleanup() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut completed = false;
+        blocking_cleanup(|| {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            rt.block_on(async { completed = true });
+            drop(rt);
+        });
+        assert!(completed, "cleanup must finish before returning");
+    }
+    #[test]
+    fn blocking_cleanup_outside_runtime() {
+        check_blocking_cleanup();
+        drop(Desktop::new().unwrap());
+    }
+    #[tokio::test]
+    async fn blocking_cleanup_inside_runtime() {
+        check_blocking_cleanup();
+        drop(Desktop::new().unwrap());
+    }
     #[tokio::test]
     async fn portal_timeout_is_bounded() {
         let result = bounded_for(
