@@ -357,12 +357,35 @@ pub async fn execute(
     p: Arc<dyn taa_platform::Platform>,
     context: Option<&Context>,
 ) -> Value {
+    execute_guarded(n, a, c, p, context, None).await
+}
+
+pub(crate) async fn execute_guarded(
+    n: &str,
+    a: &Value,
+    c: &crate::config::Config,
+    p: Arc<dyn taa_platform::Platform>,
+    context: Option<&Context>,
+    sequence: Option<(tokio::time::Instant, usize)>,
+) -> Value {
     let event = if let Some(context) = context {
         context.begin(n, a, c, p.clone()).await
     } else {
         None
     };
-    let r = crate::execute(n, a, c, p).await;
+    // Capture and replay persistence can outlast the sequence's remaining budget.
+    // Check at the dispatch boundary, after all replay preparation has completed.
+    let r = if let Some((deadline, index)) = sequence {
+        if p.is_stopping() {
+            crate::result("Session stopped by observer", true)
+        } else if tokio::time::Instant::now() >= deadline {
+            crate::result(format!("Deadline reached before action {index}"), true)
+        } else {
+            crate::execute(n, a, c, p).await
+        }
+    } else {
+        crate::execute(n, a, c, p).await
+    };
     finish(event, &r).await;
     r
 }

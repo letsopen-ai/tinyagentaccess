@@ -299,3 +299,94 @@ async fn screenshot_single_capture_and_frame_limit() {
         assert_eq!(rows[1]["frame"].is_string(), limit.is_none());
     }
 }
+
+struct HeldCapture {
+    entered: tokio::sync::Notify,
+    release: std::sync::Barrier,
+    stopping: std::sync::atomic::AtomicBool,
+    dispatched: std::sync::atomic::AtomicUsize,
+}
+impl Platform for HeldCapture {
+    fn name(&self) -> &str {
+        "held-capture"
+    }
+    fn screen_size(&self) -> (u32, u32) {
+        (10, 10)
+    }
+    fn capture(&self) -> Result<Frame, String> {
+        self.entered.notify_one();
+        self.release.wait();
+        Ok(Frame::solid(10, 10, [0, 0, 0, 255]))
+    }
+    fn perform(&self, _: Operation) -> Result<(), String> {
+        self.dispatched
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sequence_rechecks_deadline_and_stop_after_replay_capture() {
+    for stop in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(tmp.path());
+        let p = Arc::new(HeldCapture {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Barrier::new(2),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            dispatched: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let task = {
+            let p = p.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let mut c = Config::default();
+                c.agent_access.screen_resolution = "native".into();
+                taa_tools::sequence_recorded(
+                    &json!({"actions":[{"type":"key","keys":"a"},{"type":"key","keys":"b"}]}),
+                    &c,
+                    p,
+                    SequenceLimits::default(),
+                    Some(&ctx),
+                )
+                .await
+            })
+        };
+        p.entered.notified().await;
+        // Hold capture until the condition changes. Virtual time avoids wall-clock
+        // margins, including on slow Windows CI, and exercises the full 60s limit.
+        if stop {
+            p.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        }
+        p.release.wait();
+        let response = task.await.unwrap();
+        assert_eq!(p.dispatched.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(response["isError"], true);
+        let body: Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+        let reason = if stop {
+            "Session stopped by observer"
+        } else {
+            "Deadline reached before action 0"
+        };
+        assert_eq!(body["sequence_summary"]["stop_reason"], reason);
+        assert_eq!(body["sequence_summary"]["stopped_at_index"], 0);
+        assert_eq!(body["action_results"][0]["status"], "error");
+        assert_eq!(body["action_results"][1]["status"], "skipped");
+        ctx.recorder.end();
+        let rows: Vec<Value> = fs::read_to_string(log_path(tmp.path()))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["phase"], "after");
+        assert_eq!(rows[1]["response"]["isError"], true);
+        assert_eq!(rows[1]["response"]["content"][0]["text"], reason);
+    }
+}

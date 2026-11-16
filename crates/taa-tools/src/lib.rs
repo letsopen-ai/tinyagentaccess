@@ -564,7 +564,7 @@ pub async fn sequence_recorded(
                 result("Wait completed", false)
             }
         } else {
-            replay::execute(n, &args, c, p.clone(), replay).await
+            replay::execute_guarded(n, &args, c, p.clone(), replay, Some((deadline, i))).await
         };
         replay::finish(event, &r).await;
         executed += 1;
