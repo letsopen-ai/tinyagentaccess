@@ -134,6 +134,13 @@ pub fn list(c: &Config, modern: bool) -> Value {
 "get_session_info"=>"Return local desktop session metadata.",_=>n},"inputSchema":schema(n,modern)})).collect::<Vec<_>>()})
 }
 pub fn validate(n: &str, a: &Value, screen: (u32, u32)) -> Result<(), String> {
+    validate_arguments(n, a, Some(screen))
+}
+/// Validate argument shape without consulting potentially stale display dimensions.
+pub fn validate_shape(n: &str, a: &Value) -> Result<(), String> {
+    validate_arguments(n, a, None)
+}
+fn validate_arguments(n: &str, a: &Value, screen: Option<(u32, u32)>) -> Result<(), String> {
     if !a.is_object() {
         return Err("arguments must be an object".into());
     }
@@ -190,6 +197,9 @@ pub fn validate(n: &str, a: &Value, screen: (u32, u32)) -> Result<(), String> {
             k.as_str(),
             "x" | "start_x" | "end_x" | "y" | "start_y" | "end_y"
         ) {
+            let Some(screen) = screen else {
+                continue;
+            };
             let bound = if k.ends_with('x') { screen.0 } else { screen.1 };
             if bound == 0 {
                 return Err(

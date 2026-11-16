@@ -25,11 +25,12 @@ pub fn save_result(dir: &str, session: &str, result: &Value) {
                 .duration_since(SystemTime::UNIX_EPOCH)?
                 .as_millis();
             let (year, month, day) = date((millis / 86_400_000) as i64);
-            let path = Path::new(dir)
+            let root: std::path::PathBuf = Path::new(dir).components().collect();
+            let path = root
                 .join("agentaccess/screenshots")
                 .join(format!("year={year:04}/month={month:02}/day={day:02}"))
                 .join(session);
-            private_dirs(&path)?;
+            private_dirs(&path, &root)?;
             // PROVISIONAL (not published by AWS): real JPEG extension, UTC epoch millis
             // plus collision counter, create_new atomic publication; Windows ACLs best effort.
             let ext = if block["mimeType"] == "image/jpeg" {
@@ -65,9 +66,15 @@ pub fn save_result(dir: &str, session: &str, result: &Value) {
         }
     }
 }
-fn private_dirs(path: &Path) -> std::io::Result<()> {
+fn private_dirs(path: &Path, root: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        private_dirs(parent)?;
+        if path == root {
+            // Configured ancestors may be system aliases such as macOS /var.
+            // The configured directory and all sink-owned descendants stay strict.
+            fs::create_dir_all(parent)?;
+        } else {
+            private_dirs(parent, root)?;
+        }
     }
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(()),
@@ -85,7 +92,7 @@ fn private_dirs(path: &Path) -> std::io::Result<()> {
                 builder.mode(0o700);
             }
             match builder.create(path) {
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => private_dirs(path),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => private_dirs(path, root),
                 other => other,
             }
         }

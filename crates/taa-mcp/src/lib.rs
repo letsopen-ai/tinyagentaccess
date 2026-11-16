@@ -663,6 +663,17 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
                 }
                 return StatusCode::NOT_FOUND.into_response();
             }
+            if _guard.is_some() {
+                // Cleanup workers may still be queued behind this request. Release an
+                // expired owner's input under our desktop lock before admitting work.
+                let owner = s.held.lock().unwrap().as_ref().map(|h| h.owner.clone());
+                if let Some(owner) = owner {
+                    let expired = !s.sessions.lock().unwrap().open.contains_key(&owner);
+                    if expired {
+                        s.release(&owner).await;
+                    }
+                }
+            }
             // Admission and closure are atomic with respect to the session map.
             // The desktop lock prevents another tool close from overtaking admission.
             let active = {
@@ -687,7 +698,7 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
             } else if let Err(e) = if n == "execute_sequence" {
                 Ok(())
             } else {
-                taa_tools::validate(n, &args, taa_tools::screen(&s.config, s.platform.as_ref()))
+                taa_tools::validate_shape(n, &args)
             } {
                 client(e)
             } else {
@@ -883,6 +894,60 @@ mod tests {
         .await
         .unwrap();
         assert!(s.held.lock().unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn modern_new_releases_expired_button_before_move() {
+        let mut config = Config::default();
+        config.agent_access.screen_resolution = "native".into();
+        let mock = Arc::new(taa_platform::MockPlatform::recording());
+        let s = Server::new(config, mock.clone());
+        let id = s.open(MODERN).unwrap();
+        let point = taa_platform::Point { x: 10, y: 20 };
+        SessionPlatform {
+            inner: mock.clone(),
+            held: s.held.clone(),
+            owner: id.clone(),
+        }
+        .perform(taa_platform::Operation::Button(point, true, vec![]))
+        .unwrap();
+        s.sessions
+            .lock()
+            .unwrap()
+            .open
+            .get_mut(&id)
+            .unwrap()
+            .touched = Instant::now() - Duration::from_secs(1000);
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-protocol-version", MODERN.parse().unwrap());
+        headers.insert("mcp-method", "tools/call".parse().unwrap());
+        headers.insert("mcp-name", format!("{PREFIX}move_pointer").parse().unwrap());
+        // Current-thread runtime: the spawned cleanup cannot acquire the lock
+        // before this request does. No sleeps or scheduler timing assumptions.
+        let response = handle_one(
+            s,
+            headers,
+            json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params": {"name":format!("{PREFIX}move_pointer"),
+                    "arguments":{"mcpSessionId":"NEW","x":30,"y":40},
+                    "_meta":{"io.modelcontextprotocol/protocolVersion":MODERN,
+                        "io.modelcontextprotocol/clientCapabilities":{}}}
+            }),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["result"]["isError"], false, "{result}");
+        assert_eq!(
+            mock.operations.lock().unwrap().as_slice(),
+            &[
+                taa_platform::Operation::Button(point, true, vec![]),
+                taa_platform::Operation::Button(point, false, vec![]),
+                taa_platform::Operation::Move(taa_platform::Point { x: 30, y: 40 }),
+            ]
+        );
     }
     #[tokio::test]
     async fn sequence_press_is_released_by_delete() {
