@@ -334,3 +334,131 @@ fn malformed_arguments() {
         json!({"x":1919,"y":1079})
     );
 }
+
+#[test]
+fn missing_action_fields() {
+    let mut cases = vec![];
+    for action in [
+        "click",
+        "double_click",
+        "move",
+        "scroll",
+        "drag",
+        "keypress",
+        "type",
+    ] {
+        let args = match action {
+            "scroll" => json!({"x":1,"y":2,"scroll_x":0,"scroll_y":120}),
+            "drag" => json!({"path":[{"x":1,"y":2},{"x":3,"y":4}]}),
+            "keypress" => json!({"keys":["a"]}),
+            "type" => json!({"text":"hello"}),
+            _ => json!({"x":1,"y":2}),
+        };
+        cases.push((IDS[3], "computer", args, Some(("type", action))));
+    }
+    for id in &IDS[..3] {
+        for (action, args) in [
+            (
+                "scroll",
+                json!({"coordinate":[1,2],"scroll_direction":"down","scroll_amount":1}),
+            ),
+            (
+                "left_click_drag",
+                json!({"coordinate":[1,2],"start_coordinate":[3,4]}),
+            ),
+            ("hold_key", json!({"text":"a","duration":1})),
+            ("type", json!({"text":"hello"})),
+            ("key", json!({"text":"a"})),
+            ("mouse_move", json!({"coordinate":[1,2]})),
+        ] {
+            let split = id.contains("TOOLSET");
+            cases.push((
+                id,
+                if split { action } else { "computer" },
+                args,
+                (!split).then_some(("action", action)),
+            ));
+        }
+    }
+    for (name, args) in [
+        (
+            "scroll",
+            json!({"x":1,"y":2,"direction":"down","magnitude":1}),
+        ),
+        (
+            "drag_and_drop",
+            json!({"x":1,"y":2,"destination_x":3,"destination_y":4}),
+        ),
+        ("type", json!({"text":"hello"})),
+        ("press_key", json!({"key":"a"})),
+        ("hotkey", json!({"keys":["a"]})),
+        ("click", json!({"x":1,"y":2})),
+    ] {
+        cases.push((IDS[4], name, args, None));
+    }
+    for (id, name, args, discriminator) in cases {
+        for field in args.as_object().unwrap().keys() {
+            let mut missing = args.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            if let Some((key, action)) = discriminator {
+                missing[key] = json!(action);
+            }
+            assert_eq!(
+                interface(id)
+                    .translate(name, &missing, (1280, 720))
+                    .unwrap_err(),
+                format!("missing {field}"),
+                "{id} {name} {missing}"
+            );
+        }
+    }
+}
+
+#[test]
+fn advertised_enums_are_enforced() {
+    for (id, name, args, field) in [
+        (IDS[0], "computer", json!({"action":"unknown"}), "action"),
+        (IDS[3], "computer", json!({"type":"unknown"}), "type"),
+        (
+            IDS[3],
+            "computer",
+            json!({"type":"click","x":1,"y":2,"button":"LEFT"}),
+            "button",
+        ),
+        (
+            IDS[0],
+            "computer",
+            json!({"action":"scroll","coordinate":[1,2],"scroll_direction":"DOWN","scroll_amount":1}),
+            "scroll_direction",
+        ),
+        (
+            IDS[2],
+            "scroll",
+            json!({"coordinate":[1,2],"scroll_direction":"DOWN","scroll_amount":1}),
+            "scroll_direction",
+        ),
+        (
+            IDS[4],
+            "scroll",
+            json!({"x":1,"y":2,"direction":"DOWN","magnitude":1}),
+            "direction",
+        ),
+    ] {
+        assert_eq!(
+            interface(id)
+                .translate(name, &args, (1280, 720))
+                .unwrap_err(),
+            format!("invalid {field}")
+        );
+    }
+    assert_eq!(
+        interface(IDS[3])
+            .translate(
+                "computer",
+                &json!({"type":"scroll","x":1,"y":2,"scroll_x":0,"scroll_y":0}),
+                (1280, 720)
+            )
+            .unwrap_err(),
+        "scroll requires a nonzero scroll_x or scroll_y"
+    );
+}

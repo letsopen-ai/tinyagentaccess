@@ -208,7 +208,11 @@ fn check(schema: &Value, a: &Value) -> Result<(), String> {
             "boolean" => v.is_boolean(),
             _ => true,
         };
-        if !valid {
+        if !valid
+            || rule["enum"]
+                .as_array()
+                .is_some_and(|choices| !choices.contains(v))
+        {
             return Err(format!("invalid {k}"));
         }
     }

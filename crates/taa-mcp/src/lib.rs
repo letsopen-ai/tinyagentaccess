@@ -628,7 +628,11 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
     } else {
         None
     };
-    let interface = if matches!(method, "tools/list" | "tools/call") {
+    let forwarded_call = method == "tools/call"
+        && params["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("forwarded___"));
+    let interface = if matches!(method, "tools/list" | "tools/call") && !forwarded_call {
         match Interface::parse(header(&h, "x-amzn-agentaccess-computer-use-interface-id")) {
             Ok(i) => i,
             Err(e) => return request_error(modern, &id, -32602, &e, existing),

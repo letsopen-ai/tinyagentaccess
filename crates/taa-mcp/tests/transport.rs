@@ -219,6 +219,7 @@ async fn interfaces_and_security() {
         "ANTHROPIC_COMPUTER_TOOLSET_20260801",
         "GOOGLE_COMPUTER_USE_3X_DESKTOP_V1",
         "bad",
+        "openai_computer_v1",
     ] {
         let r = value(
             &request(
@@ -233,7 +234,7 @@ async fn interfaces_and_security() {
             .await
             .2,
         );
-        if interface == "bad" {
+        if matches!(interface, "bad" | "openai_computer_v1") {
             assert_eq!(r["error"]["code"], -32602);
         } else {
             let tools = r["result"]["tools"].as_array().unwrap();
@@ -1053,8 +1054,6 @@ async fn forwarding_errors_and_interface_independence() {
             ));
             let mut unknown_headers = headers.clone();
             unknown_headers.last_mut().unwrap().1 = "unknown";
-            let (_, _, body) = request(&a, "POST", json!({"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":"forwarded___fixture___echo","arguments":{"mcpSessionId":"NEW"}}}), &unknown_headers).await;
-            assert_eq!(value(&body)["error"]["code"], -32602);
             let (_, _, body) = request(
                 &a,
                 "POST",
@@ -1072,7 +1071,7 @@ async fn forwarding_errors_and_interface_independence() {
             } else {
                 json!({"text":"untouched","code":code})
             };
-            let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"forwarded___fixture___echo","arguments":args}}),&headers).await;
+            let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"forwarded___fixture___echo","arguments":args}}),&unknown_headers).await;
             let reply = value(&body);
             assert_eq!(reply["result"]["isError"], true);
             assert_eq!(reply["result"]["content"][0]["text"], expected);
@@ -1192,18 +1191,22 @@ async fn forwarding_idle_expiry_and_shutdown_reap_children() {
 }
 
 #[tokio::test]
-async fn disabled_forwarding_validates_interface_for_forwarded_name() {
+async fn disabled_forwarding_ignores_interface_for_forwarded_name() {
     let (_, _, body) = request(
         &app(),
         "POST",
-        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"forwarded___x___y"}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"forwarded___x___y","arguments":{"mcpSessionId":"NEW"}}}),
         &[
             ("mcp-protocol-version", MODERN),
             ("x-amzn-agentaccess-computer-use-interface-id", "bad"),
         ],
     )
     .await;
-    assert_eq!(value(&body)["error"]["code"], -32602);
+    assert_eq!(value(&body)["result"]["isError"], true);
+    assert!(value(&body)["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown tool"));
 }
 struct GrownDisplay {
     mock: MockPlatform,
@@ -1478,6 +1481,45 @@ async fn dialect_permissions() {
     ] {
         let (_,_,body) = request(&a,"POST",json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"computer","arguments":args}}),&headers).await;
         assert_eq!(value(&body)["result"]["isError"], error);
+    }
+    assert!(platform.operations.lock().unwrap().is_empty());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn dialect_action_errors_are_client_errors() {
+    let platform = Arc::new(MockPlatform::recording());
+    let server = Server::new(Config::default(), platform.clone());
+    let a = router(server.clone());
+    let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
+    let sid = h["mcp-session-id"].to_str().unwrap();
+    for (interface, args, expected) in [
+        (
+            "OPENAI_COMPUTER_V1",
+            json!({"type":"scroll","x":1,"y":2}),
+            "missing scroll_x",
+        ),
+        (
+            "OPENAI_COMPUTER_V1",
+            json!({"type":"scroll","x":1,"y":2,"scroll_x":0,"scroll_y":0}),
+            "scroll requires a nonzero scroll_x or scroll_y",
+        ),
+        (
+            "ANTHROPIC_COMPUTER_20251124",
+            json!({"action":"type"}),
+            "missing text",
+        ),
+    ] {
+        let (_, _, body) = request(&a, "POST", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"computer","arguments":args}}), &[
+            ("mcp-session-id", sid),
+            ("x-amzn-agentaccess-computer-use-interface-id", interface),
+        ]).await;
+        let reply = value(&body);
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(
+            reply["result"]["content"][0]["text"],
+            format!("CLIENT_ERROR: {expected}")
+        );
     }
     assert!(platform.operations.lock().unwrap().is_empty());
     server.shutdown().await;

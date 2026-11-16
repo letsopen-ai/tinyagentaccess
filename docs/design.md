@@ -197,13 +197,16 @@ All five dialects are **best-effort, unverified vs AWS**. The registry lives in
 one native call, then the HTTP handler uses its existing desktop lock, session
 platform (including held-button ownership), validation, execution and screenshot
 saving. Native execute_sequence remains unchanged and takes native actions only.
-The interface header is read on each list/call, including forwarded calls; nothing
+The interface header is read on each list/non-forwarded call; nothing
 is stored in a session. Only the 14 standard desktop tools are replaced. Existing
 session/sequence/wait tools and forwarded tools retain their schemas and behavior;
 future catalog/session native tools are retained by the filter.
 
 Each local choice below is **PROVISIONAL**, not an AWS-confirmed behavior:
 
+- Forwarded calls ignore the interface header entirely, including unknown values and
+  calls when forwarding is disabled. This prioritizes §8 interface independence over
+  §6 unsupported-interface rejection; the spec does not say which rule wins.
 - All five input schemas are vendor-derived approximations, not AWS-confirmed.
   Anthropic's single tool uses `action`, coordinates as pairs, and text for keys;
   its toolset splits these into individual functions. This permits use with
@@ -215,7 +218,7 @@ Each local choice below is **PROVISIONAL**, not an AWS-confirmed behavior:
   translation strips it and results use the existing session envelope. AWS support
   is unknown; this preserves usable local stateless behavior.
 - Anthropic scroll amounts and Gemini `magnitude` are notches multiplied by 120,
-  using checked integer arithmetic; directions are case-insensitive and canonicalized
+  using checked integer arithmetic; schema-enumerated lowercase directions are canonicalized
   to native title case. This uses native documented ticks without overflow.
 - Key conversion preserves xdotool names and normalizes Control/CTRL to ctrl,
   Command/cmd/Meta/Win to super, Option to alt, Shift, Enter/Return, Esc/Escape and
@@ -228,6 +231,8 @@ Each local choice below is **PROVISIONAL**, not an AWS-confirmed behavior:
 - OpenAI scroll_x/scroll_y are signed native ticks (positive right/down); absolute
   magnitude is checked. Both fields are required. Diagonal scroll is rejected
   before dispatch so callers can issue separate axis calls without partial execution.
+  Zero deltas on both axes are rejected with CLIENT_ERROR instead of dispatching a
+  zero-tick scroll; the spec does not define this case.
 - OpenAI wait is rejected with CLIENT_ERROR guidance to agentaccess___wait, resolving
   the contradictory sample in favor of the documented dedicated pause tool.
 - Gemini uses x/y, destination_x/destination_y for drag, text for type, key for

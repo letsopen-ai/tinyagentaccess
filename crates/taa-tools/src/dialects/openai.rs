@@ -7,6 +7,17 @@ pub fn schema() -> Value {
 }
 pub fn translate(a: &Value) -> Result<(String, Value), String> {
     let action = string(a, "type")?;
+    let required: &[&str] = match action {
+        "type" => &["text"],
+        "keypress" => &["keys"],
+        "drag" => &["path"],
+        "move" | "click" | "double_click" => &["x", "y"],
+        "scroll" => &["x", "y", "scroll_x", "scroll_y"],
+        _ => &[],
+    };
+    let mut input = schema();
+    input["required"] = json!(required);
+    check(&input, a)?;
     let mut out = json!({});
     let n = match action {
         "wait" => return Err(rejected()),
@@ -63,6 +74,9 @@ pub fn translate(a: &Value) -> Result<(String, Value), String> {
 }
 // PROVISIONAL: pixel-like vendor deltas treated as native ticks, one axis per call.
 fn scroll(x: i64, y: i64) -> Result<(&'static str, i64), String> {
+    if x == 0 && y == 0 {
+        return Err("scroll requires a nonzero scroll_x or scroll_y".into());
+    }
     if x != 0 && y != 0 {
         return Err("diagonal scroll is unsupported; send separate axis calls".into());
     }
