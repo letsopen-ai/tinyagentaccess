@@ -1,4 +1,5 @@
-//! CoreGraphics FFI: no Objective-C runtime or SDK build step required.
+//! ScreenCaptureKit capture with CoreGraphics geometry, conversion and input.
+use crate::macos_capture::{self, permission};
 use crate::macos_keys::ascii;
 use crate::{
     input::{self, Input, EVENT_DELAY},
@@ -39,10 +40,8 @@ unsafe extern "C" {
     fn CGDisplayModeRelease(m: Ref);
     fn CGDisplayBounds(d: u32) -> CGRect;
     fn CGPreflightScreenCaptureAccess() -> bool;
-    fn CGDisplayCreateImage(d: u32) -> Ref;
     fn CGImageGetWidth(i: Ref) -> usize;
     fn CGImageGetHeight(i: Ref) -> usize;
-    fn CGImageRelease(i: Ref);
     fn CGColorSpaceCreateDeviceRGB() -> Ref;
     fn CGColorSpaceRelease(c: Ref);
     fn CGBitmapContextCreate(
@@ -78,6 +77,7 @@ unsafe extern "C" {
 pub struct Mac {
     size: AtomicU64,
     lock: Mutex<Option<Desktop>>,
+    capture_lock: Mutex<()>,
 }
 impl Mac {
     pub fn new() -> Self {
@@ -85,9 +85,6 @@ impl Mac {
         let _ = p.capture_geometry();
         p
     }
-}
-fn permission(screen: bool) -> String {
-    format!("{} permission is required: System Settings > Privacy & Security > {} > enable <the terminal/app running tinyagentaccess>, then restart it",if screen{"Screen Recording"}else{"Accessibility"},if screen{"Screen Recording"}else{"Accessibility"})
 }
 fn post(e: Ref) -> Result<(), String> {
     if e.is_null() {
@@ -215,7 +212,7 @@ impl Desktop {
 }
 impl Platform for Mac {
     fn name(&self) -> &str {
-        "macos-coregraphics"
+        macos_capture::backend_name(macos_capture::available())
     }
     fn screen_size(&self) -> (u32, u32) {
         let s = self.size.load(Ordering::Relaxed);
@@ -235,20 +232,17 @@ impl Platform for Mac {
         Ok((w, h))
     }
     fn capture(&self) -> Result<Frame, String> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.capture_lock.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             if !CGPreflightScreenCaptureAccess() {
                 return Err(permission(true));
             }
             let d = CGMainDisplayID();
-            let image = CGDisplayCreateImage(d);
-            if image.is_null() {
-                return Err("CoreGraphics capture failed; check Screen Recording permission and an unlocked desktop".into());
-            }
+            let owned_image = macos_capture::capture(d, physical_size(d)?)?;
+            let image = owned_image.0;
             let w = CGImageGetWidth(image);
             let h = CGImageGetHeight(image);
             if physical_size(d) != Ok((w as u32, h as u32)) {
-                CGImageRelease(image);
                 return Err("CoreGraphics: capture and current physical display mode disagree; retry after display changes settle".into());
             }
             self.size
@@ -259,7 +253,6 @@ impl Platform for Mac {
                 CGBitmapContextCreate(f.rgba.as_mut_ptr().cast(), w, h, 8, w * 4, space, 0x4001);
             CGColorSpaceRelease(space);
             if context.is_null() {
-                CGImageRelease(image);
                 return Err("CoreGraphics bitmap context creation failed".into());
             }
             CGContextDrawImage(
@@ -274,7 +267,7 @@ impl Platform for Mac {
                 image,
             );
             CGContextRelease(context);
-            CGImageRelease(image);
+            drop(owned_image);
             let b = CGDisplayBounds(d);
             f.logical_size = (b.size.width as u32, b.size.height as u32);
             let e = CGEventCreate(std::ptr::null_mut());

@@ -7,6 +7,8 @@ pub mod keys;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(any(target_os = "macos", test))]
+mod macos_capture;
+#[cfg(any(target_os = "macos", test))]
 mod macos_keys;
 pub mod pixels;
 #[cfg(target_os = "linux")]
