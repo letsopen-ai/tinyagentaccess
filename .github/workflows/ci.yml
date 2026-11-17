@@ -27,11 +27,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y xvfb
       - run: cargo test -p taa-tools --test x11_e2e -- --ignored --nocapture
   test-macos:
-    # Runner must be registered for this repo. Hosted macOS is reserved for releases.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, macOS, ARM64, unsigned]
+    runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -46,9 +42,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
   windows:
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
