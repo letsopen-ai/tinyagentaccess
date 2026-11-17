@@ -1,0 +1,92 @@
+# Third-party notices
+
+tinyAgentAccess is [MIT licensed](LICENSE), Copyright (c) 2026 Nie Chen.
+Third-party crates retain their own copyrights and license terms. `Cargo.lock`
+records the resolved crates; their `Cargo.toml` manifests declare their licenses.
+The [workspace manifests](Cargo.toml) declare direct dependencies and
+[deny.toml](deny.toml) checks the dependency license choices with
+`cargo deny check licenses`. The lockfile itself does not contain license texts.
+Redistributors must preserve applicable dependency notices and license texts;
+this summary does not replace those obligations.
+
+## Additional license terms
+
+- [jpeg-encoder](https://crates.io/crates/jpeg-encoder/0.6.1): `(MIT OR Apache-2.0) AND IJG`.
+  This software is based in part on the work of the Independent JPEG Group.
+- [unicode-ident](https://crates.io/crates/unicode-ident): also uses Unicode-3.0;
+  retain the crate's Unicode data license with redistributed data.
+- [r-efi](https://crates.io/crates/r-efi): `MIT OR Apache-2.0 OR LGPL-2.1-or-later`;
+  this project selects MIT/Apache-2.0, not LGPL.
+- [zlib-rs](https://crates.io/crates/zlib-rs): Zlib. Its notice is reproduced below.
+- [matchit](https://crates.io/crates/matchit): `MIT AND BSD-3-Clause`.
+  Its BSD notice is reproduced below.
+
+## Research sources and trademarks
+
+[docs/aws-parity.md](docs/aws-parity.md) is a research summary of Amazon/AWS
+public documentation and the [MIT-0 AWS sample repository](https://github.com/aws-samples/sample-code-for-workspaces-agent-access),
+not a republication of AWS documentation. AWS documentation remains Amazon's
+copyright. See the [source list](docs/aws-parity.md#16-sources), including the
+[AWS developer guide](https://docs.aws.amazon.com/appstream2/latest/developerguide/agent-access.html),
+[MCP server overview](https://docs.aws.amazon.com/appstream2/latest/developerguide/agent-access-mcp-server-overview.html),
+[native tools](https://docs.aws.amazon.com/appstream2/latest/developerguide/agent-access-mcp-server-tools.html),
+and [computer-use interfaces](https://docs.aws.amazon.com/appstream2/latest/developerguide/agent-access-computer-use-interfaces.html).
+Trademarks belong to their owners. tinyAgentAccess is independent of Amazon and AWS.
+
+## zlib-rs notice
+
+```text
+(C) 2024 Trifecta Tech Foundation
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+
+3. This notice may not be removed or altered from any source distribution.
+```
+
+## matchit BSD notice
+
+```text
+BSD 3-Clause License
+
+Copyright (c) 2013, Julien Schmidt
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
