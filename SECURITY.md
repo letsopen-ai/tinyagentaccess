@@ -24,7 +24,7 @@ See [permissions](docs/permissions.md) and [design](docs/design.md).
 
 After publication, maintainers should enable private vulnerability reporting if
 the form is missing and require approval for external contributors' fork workflow
-runs. Hosted Ubuntu tests, cross-platform checks, and license checks run on fork
-PRs; self-hosted macOS CI and the Windows job skip fork PRs. Approved fork runs
-use the fork's workflow files, so runner access restrictions and human review
-remain important controls.
+runs. All CI jobs use standard GitHub-hosted runners, including macOS and
+Windows, with read-only tokens and no secrets. Fork PRs are eligible for all CI
+jobs, subject to external contributor approval. Approved fork runs use the fork's
+workflow files, so human review remains an important control.

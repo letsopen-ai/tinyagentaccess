@@ -40,12 +40,11 @@ Keep one problem per PR, use the [PR template](.github/pull_request_template.md)
 and include tests and documentation for behavior changes. Separate verified AWS
 facts from local choices; see [engineering guidelines](AGENTS.md).
 
-PR checks use GitHub-hosted Ubuntu and Windows. macOS CI uses a maintainer
-self-hosted runner and does not run on fork PRs; the Windows job also skips fork
-PRs. Hosted Ubuntu tests (including the Xvfb X11 end-to-end test), cross-platform
-checks, and license checks run on fork PRs. After publication, maintainers should require
+PR checks use standard GitHub-hosted Ubuntu, macOS, and Windows runners. All CI
+jobs run on fork PRs, including Ubuntu tests with the Xvfb X11 end-to-end test,
+cross-platform checks, and license checks. After publication, maintainers should require
 approval for external contributors' fork workflow runs. Approved runs use the
-fork's workflow files, so runner access restrictions and human review still matter.
+fork's workflow files, so human review still matters.
 
 Release packaging is separate from PR CI. Pushing a `v*` tag runs `release.yml`,
 which builds Linux musl, macOS, and Windows archives containing
