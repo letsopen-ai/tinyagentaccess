@@ -1,10 +1,45 @@
 # tinyAgentAccess
 
+[![CI](https://github.com/letsopen-ai/tinyagentaccess/actions/workflows/ci.yml/badge.svg)](https://github.com/letsopen-ai/tinyagentaccess/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 An open-source, self-hostable, local-first Rust rebuild of the Amazon WorkSpaces for AI agents MCP server. AWS-compatible native tool names, running on your own computer, with no AWS dependency.
 
-**Pre-alpha — milestone 7:** desktop capture/input, sequences, forwarding, dialect adapters, local replay and human Stop. X11 is exercised end to end; macOS, Windows and Wayland need real-session validation.
+**Pre-alpha:** desktop capture/input, sequences, forwarding, dialect adapters, local replay and human Stop. No tagged release yet.
 
-**Security: no authentication yet. Binds to localhost by default. Do not expose this server to a network or the public internet.** Security: see [SECURITY.md](SECURITY.md).
+**Security: no authentication. Binds to localhost by default. Do not expose this server to a network or the public internet. Wildcard binds are rejected; concrete non-loopback binds warn. Host/Origin checks are not authentication.** Security: see [SECURITY.md](SECURITY.md).
+
+**Not affiliated:** tinyAgentAccess is an independent project, not affiliated with,
+endorsed by, or associated with Amazon Web Services or Amazon. "Amazon", "AWS",
+"Amazon WorkSpaces", and related names are trademarks of Amazon.com, Inc. or its
+affiliates. Compatibility is a local reimplementation from public documentation
+and the MIT-0 sample; this is not an official AWS product.
+
+### Feature and parity status
+
+| Area | Status |
+| --- | --- |
+| Native tools | Local capture/input, session, wait, and sequences; AWS-only tools dropped (see [design](docs/design.md)) |
+| Linux X11 | Verified end to end on Xvfb (CI / lab); real desktop sessions need separate validation |
+| Linux Wayland | Experimental; unverified on real GNOME/KDE sessions |
+| macOS | ScreenCaptureKit verified on one non-Retina host |
+| Windows | Compiled / CI; GUI untested |
+| Forwarding | Local stdio MCP tools |
+| Dialects | Best-effort, **PROVISIONAL**, unverified against AWS |
+| Local replay / observer | **TINY-PROPOSAL**; local artifacts and human Stop |
+| Authentication | Not implemented |
+
+### Current limitations / known issues
+
+- Tk and some window client areas may capture blank on macOS while the title bar remains visible.
+- Retina, multi-monitor, denied-permission, and real GNOME/KDE Wayland behavior are not fully verified.
+- Dialect schemas and forwarded-tool behavior with an unknown interface header are provisional.
+- AWS mid-sequence Stop semantics are unknown; local sequences check Stop between steps.
+
+### Build and run from source
+
+Install Rust 1.88+ (edition 2021), clone this repository, and run from its root.
+See [permissions](docs/permissions.md) and [testing](docs/testing.md) for OS setup.
 
 ```sh
 cargo run -p tinyagentaccess -- serve
@@ -28,13 +63,13 @@ curl -sS -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25'
 curl -sS -i -X DELETE -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25' http://127.0.0.1:8765/mcp
 ```
 
-Run SDK interop against the running server with `/tmp/mcpvenv/bin/python scripts/interop_python_sdk.py --url http://127.0.0.1:8765/mcp`, or install `mcp==2.1.1` in your own venv and run the script there. It tests both legacy/stateful and 2026-07-28/stateless modes.
+Run SDK interop against the running server by installing `mcp==2.1.1` in a virtual environment and running `python scripts/interop_python_sdk.py --url http://127.0.0.1:8765/mcp`. It tests both legacy/stateful and 2026-07-28/stateless modes.
 
 Desktop requirements:
 
 - **X11:** run inside the graphical session with `DISPLAY` and Xauthority access. Uses pure Rust x11rb, XTest input, RandR primary monitor and GetImage capture. No Xlib/libxcb development packages.
 - **Wayland (experimental):** install xdg-desktop-portal plus the GNOME/KDE backend. Approve Screenshot and RemoteDesktop access, selecting your primary monitor. Persistent consent tokens are stored with mode 0600 under `$XDG_STATE_HOME/tinyagentaccess/portal-restore-token` (default `~/.local/state/...`). Capture uses the Screenshot portal, without libpipewire; use a **single-monitor session** for now because that API may return the entire desktop. Known Screenshot/RemoteDesktop ratio mismatches fail before pointer injection; equal ratios cannot prove monitor identity. The portal cannot force primary-monitor capture or reliably honor `include_cursor=false`/`true`. Portal Unicode delivery still requires compositor testing. Consent waits are bounded to 60 seconds; cached session info stays available.
-- **macOS:** grant Screen Recording and Accessibility to the terminal/app launching the server, then restart it. ScreenCaptureKit screenshots on macOS 14+ and CGEvent input preserve Retina pixel/point mapping. The binary requires macOS 12.3+; when the screenshot class is absent, capture uses a dynamically resolved legacy CoreGraphics API if available. tinyagentaccess never requests a permission prompt; macOS 15+ may show its own periodic Screen Recording confirmation.
+- **macOS:** grant Screen Recording and Accessibility to the terminal/app launching the server, then restart it. ScreenCaptureKit screenshots on macOS 14+ and CGEvent input are intended to preserve Retina pixel/point mapping; Retina behavior is not fully verified. The binary requires macOS 12.3+; when the screenshot class is absent, capture uses a dynamically resolved legacy CoreGraphics API if available. tinyagentaccess never requests a permission prompt; macOS 15+ may show its own periodic Screen Recording confirmation.
 - **Windows:** GDI primary-display capture and DPI-aware SendInput. Use an unlocked interactive desktop. UAC/secure desktop and higher-integrity windows cannot be controlled. Code is cross-compiled here; GUI validation is still needed.
 
 M2 targets the **primary display only** (Wayland currently requires one display). Default images are 1280×720, aspect-preserving with centered black bars; clicks in bars clamp to the display edge. Native mode returns physical capture dimensions. All desktop operations run in blocking workers. PNG and JPEG are supported. See [keys](docs/keys.md), [permissions](docs/permissions.md), [testing](docs/testing.md) and the [design limitations](docs/design.md).
@@ -45,7 +80,11 @@ Workspace: `crates/tinyagentaccess` (CLI), `crates/taa-mcp` (HTTP/session lifecy
 
 See [verified AWS parity facts](docs/aws-parity.md), [design and compatibility decisions](docs/design.md), and [example config](config.example.toml). Validate with `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`.
 
-Licensed under the [MIT License](LICENSE).
+See [Contributing](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md),
+[Security](SECURITY.md), [Changelog](CHANGELOG.md), and
+[third-party notices](THIRD_PARTY_NOTICES.md).
+
+[MIT](LICENSE) © 2026 Nie Chen.
 
 Wildcard binds (`0.0.0.0` / `::`) are rejected because this server has no authentication. Use the loopback default or an explicit concrete IP; non-loopback binds emit a no-auth warning and only that IP or loopback Host values are accepted.
 
@@ -53,7 +92,7 @@ Local screenshot saving is optional and disabled by default:
 
 ```toml
 [screenshots]
-save_dir = "" # or an absolute private directory, e.g. /home/me/screenshots
+save_dir = "" # disabled; otherwise set an absolute private directory
 ```
 
 Returned standalone and sequence terminal images are saved under `agentaccess/screenshots/year=YYYY/month=MM/day=DD/{session-id}/` using UTC epoch-millisecond filenames and the real PNG/JPEG extension. Unix directories/files use 0700/0600 when created; Windows inherits directory ACLs. Save failures warn on stderr and leave tool results intact. Relative save paths are rejected. No cloud upload occurs.

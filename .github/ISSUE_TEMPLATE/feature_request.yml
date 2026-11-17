@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a focused improvement.
+body:
+  - type: markdown
+    attributes:
+      value: "AWS parity claims need public evidence from docs/aws-parity.md. Undocumented local choices must be marked PROVISIONAL or TINY-PROPOSAL; local additions are not confirmed AWS behavior. Authentication work requires an explicit scope."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Proposed outcome
+      description: Include public sources for any AWS compatibility claim.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

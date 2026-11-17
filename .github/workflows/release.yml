@@ -1,0 +1,116 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+# Hosted macOS is skipped while private. First real release: publish the repo,
+# then a maintainer pushes a v* tag. Manual runs only upload artifacts.
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+        with:
+          tool: cargo-zigbuild@0.20.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.13.0
+      - name: Build CLI only
+        run: cargo zigbuild --release --locked -p tinyagentaccess --bin tinyagentaccess --target ${{ matrix.target }}
+      - run: bash scripts/package.sh ${{ matrix.target }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+  macos:
+    if: github.event.repository.private == false
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build CLI only
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.3"
+        run: cargo build --release --locked -p tinyagentaccess --bin tinyagentaccess --target ${{ matrix.target }}
+      - run: bash scripts/package.sh ${{ matrix.target }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+  publish:
+    needs: [linux, macos]
+    # A skipped private macOS build must not suppress a manual Linux dry run.
+    # Tag releases require every platform and a public repository.
+    if: >-
+      always() && !cancelled() && needs.linux.result == 'success' &&
+      ((github.event_name == 'workflow_dispatch' &&
+        (needs.macos.result == 'success' || needs.macos.result == 'skipped')) ||
+       (github.ref_type == 'tag' && github.event.repository.private == false &&
+        needs.macos.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        if: github.event.repository.private == false
+      - name: Keyless signature bundles
+        if: github.event.repository.private == false
+        working-directory: dist
+        run: |
+          for file in *.tar.gz SHA256SUMS; do
+            cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-bundle
+          path: dist/*
+          if-no-files-found: error
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        if: github.ref_type == 'tag' && github.event_name == 'push' && github.event.repository.private == false
+        with:
+          draft: true
+          files: dist/*
+          fail_on_unmatched_files: true
