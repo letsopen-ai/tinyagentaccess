@@ -9,3 +9,4 @@ __pycache__/
 /config.toml
 *.local.toml
 /dist
+/THIRD_PARTY_LICENSES.html

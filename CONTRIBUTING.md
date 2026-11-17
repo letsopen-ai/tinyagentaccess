@@ -47,7 +47,9 @@ checks, and license checks run on fork PRs. After publication, maintainers shoul
 approval for external contributors' fork workflow runs. Approved runs use the
 fork's workflow files, so runner access restrictions and human review still matter.
 
-Release packaging is separate from PR CI. Hosted macOS release jobs run only
-when the repository is public; manual runs upload artifacts without creating a
-GitHub release. The first real release follows publication and a maintainer's
-`v*` tag. There is no tagged release yet.
+Release packaging is separate from PR CI. Pushing a `v*` tag runs `release.yml`,
+which builds Linux musl, macOS, and Windows archives containing
+`THIRD_PARTY_LICENSES.html`, plus checksums and keyless cosign signatures, into a
+draft GitHub release that a maintainer publishes. Hosted macOS release jobs run
+only when the repository is public; manual runs upload artifacts without creating
+a GitHub release. Publishing to crates.io is not enabled.
