@@ -14,7 +14,7 @@ there is no guaranteed response time.
 
 ## Current boundaries
 
-This pre-alpha server has **no authentication**. It binds loopback by default;
+This server has **no authentication**. It binds loopback by default;
 do not expose it to a network or the public internet. Wildcard binds are rejected
 and concrete non-loopback binds emit a warning. Host/Origin checks reduce browser
 and DNS-rebinding risks but are not authentication and do not authenticate local

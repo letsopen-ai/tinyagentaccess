@@ -1,7 +1,9 @@
 # AWS WorkSpaces "agent access" MCP server (agentaccess-mcp): functional spec for tinyAgentAccess
 
-Status: researched Nov 16, 2026 (Asia/Shanghai). Revision 2: the teammate draft (`/home/box/shared/tinyagentaccess/aws-agentaccess-mcp-spec.md`), checked line by line against the AWS docs and extended.
+Status: researched Nov 16, 2026. Revision 2: revises an earlier draft after checking it line by line against the AWS docs and extending it.
 Scope: functional behavior to reproduce in tinyAgentAccess (Rust, letsopen-ai org). Authentication is in §12 only, for later.
+
+tinyAgentAccess is independent and is not affiliated with, endorsed by, or sponsored by Amazon Web Services or Amazon. Amazon WorkSpaces, AWS, and related marks are trademarks of Amazon.com, Inc. or its affiliates. This document independently summarizes and paraphrases AWS public documentation with citations; the [official AWS developer guide](https://docs.aws.amazon.com/appstream2/latest/developerguide/agent-access.html) is authoritative and remains Amazon’s copyright. See [§16](#16-sources) for sources; the AWS sample repository is MIT-0.
 
 ## 0. How to read this document (evidence levels)
 
@@ -18,14 +20,14 @@ Source keys (full URLs in §16): D-tools, D-cui, D-endpoint, D-session, D-connmo
 
 ## 1. Product identity
 
-- Official names: **"Amazon WorkSpaces for AI agents"** (marketing/What's New) [W-ga, P-product]. In the docs it is **"agent access"**, a feature of **Amazon WorkSpaces Applications** (formerly AppStream 2.0; the docs live under `/appstream2/`): "WorkSpaces for AI agents is the agent access feature of Amazon WorkSpaces Applications" [D-learn-more]. The IAM service name is **"Amazon WorkSpaces AgentAccess MCP Server"**, with service prefix `agentaccess-mcp` [D-sar].
+- Official names: **"Amazon WorkSpaces for AI agents"** (marketing/What's New) [W-ga, P-product]. In the docs it is **"agent access"**, a feature of **Amazon WorkSpaces Applications** (formerly AppStream 2.0; the docs live under `/appstream2/`): the developer guide identifies WorkSpaces for AI agents as the agent access feature of Amazon WorkSpaces Applications [D-learn-more]. The IAM service name is **"Amazon WorkSpaces AgentAccess MCP Server"**, with service prefix `agentaccess-mcp` [D-sar].
 - What it is: a fully managed, AWS-hosted MCP server. It gives AI agents tools to operate desktop applications in WorkSpaces Applications streaming sessions (click, type, scroll, screenshot), plus forwarding of MCP servers that run on the desktop [D-mcp-server, D-concepts].
 - Closed source. No server code is published. The only official code is the client-side sample repo [S-readme].
 - Timeline [DOC]:
   - GA on Jun 30, 2026 [W-ga].
   - Oct 20, 2026 [W-oct]: OAuth 2.0, service-managed connections (stack + user headers instead of streaming URLs), session-state query, the app catalog tools, and 4 more Regions (sa-east-1, eu-south-1, eu-south-2, ap-southeast-5).
   - Nov 3, 2026 [W-nov]: Linux and Windows 11 desktops. Linux gives agents "full root access".
-  - **Correction vs draft:** the Oct 20 update was missing from the draft.
+  - **Correction vs earlier draft:** the Oct 20 update was missing from the draft.
 
 ## 2. Architecture and transport
 
@@ -71,7 +73,7 @@ Header names are case-insensitive. The value of the interface header is case-sen
   - Domain-joined fleets [D-ident-dj, S-djauth]: `aws.agentaccess/workspacesApplicationsSamlAssertion` (base64 SAML Response) and `aws.agentaccess/workspacesApplicationsStackArn`, placed in `params._meta` of **every** JSON-RPC request.
   - The service **rejects** a request that also sends these as headers [D-ident-dj].
   - The endpoint page's mcp-proxy example instead shows `metadata={"saml_response":..., "stack_arn":...}` [D-endpoint]. These are proxy-side names. The sample notes they were never tested and only the `aws.agentaccess/...` keys were seen to work [S-readme].
-  - **Correction vs draft:** the `aws.agentaccess/...` keys are also in AWS docs (D-ident-dj), not only in the sample.
+  - **Correction vs earlier draft:** the `aws.agentaccess/...` keys are also in AWS docs (D-ident-dj), not only in the sample.
   - `aws.agentaccess/streamingSessionUrl` in `_meta` is an alternative to the streaming-URL header [S-agentsmd, IDE config example]. SAMPLE-only; not in the docs.
 - Precedence when several targeting inputs are sent: UNDOCUMENTED.
 
@@ -92,9 +94,9 @@ Header names are case-insensitive. The value of the interface header is case-sen
     - IAM action `CheckConnectionStatus`: "check the connection status of a streaming session", access level Read [D-sar, D-reg].
     - The docs example calls it **without** the `agentaccess___` prefix [D-connmode]. The tools page says "All tool names use the `agentaccess___` prefix" but does not list connection_status [D-tools]. The real listed name is UNKNOWN.
     - Other `state` values (for example a connecting or failed state), other JSON fields, input schema (the example sends `{}`), the error when the desktop fails, and whether it stays listed after CONNECTED: all UNKNOWN.
-    - **Correction vs draft:** the docs are not "inconsistent"; they simply never state the prefix.
-- Warm-up: after a streaming URL is created, the DCV session takes 5–30 s, and during that time `tools/call` may return "Unknown tool" [S-agentsmd]. The DJ doc says "The desktop can take a few moments to connect after `initialize`. If the first `tools/list` or tool call fails, wait and retry" [D-ident-dj]. On a stack with application settings persistence, the first `tools/list` waits for the user profile to load, so the sample's HTTP timeout is 300 s [S-mcpclient].
-- Image builders: the first connection is slower, so use a client timeout of at least 120 s [D-endpoint]. The MCP session idle-closes after **about 13 minutes**; the next tool call reconnects as the last logged-in user [D-cleanup].
+    - **Correction vs earlier draft:** the docs are not "inconsistent"; they simply never state the prefix.
+- Warm-up: after a streaming URL is created, the DCV session takes 5–30 s, and during that time `tools/call` may return "Unknown tool" [S-agentsmd]. The DJ doc advises allowing time for the desktop connection after `initialize` and retrying a failed initial `tools/list` or tool invocation after a delay [D-ident-dj]. On a stack with application settings persistence, the first `tools/list` waits for the user profile to load, so the sample's HTTP timeout is 300 s [S-mcpclient].
+- Image builders: the first connection is slower, so use a client timeout of at least 120 s [D-endpoint]. The MCP session idle-closes after **about 13 minutes**; a subsequent tool invocation reconnects using the user who most recently logged in [D-cleanup].
 - Fleet sessions: the MCP session idle timeout is UNDOCUMENTED. The streaming session lives until the fleet's disconnect timeout (when not expired) [D-cleanup].
 - **Ending a session**:
   - Stateful [D-cleanup]: HTTP DELETE. With `...-expire-streaming-session-on-delete: true`, a fleet session's streaming instance is terminated (autoscaling applies). An image builder is unaffected.
@@ -118,7 +120,7 @@ Header names are case-insensitive. The value of the interface header is case-sen
 
 Official list [D-tools]. "All tool names use the `agentaccess___` prefix." Application tools exist only on stacks, and user tools only on image builders. The column "Listed when" combines the docs with sample notes.
 
-### 5.1 What AWS documents per tool (verbatim facts)
+### 5.1 What AWS documents per tool (documented facts)
 
 | Tool (`agentaccess___…`) | Purpose [D-tools] | Parameters as documented [D-tools] | IAM action [D-sar] |
 |---|---|---|---|
@@ -135,7 +137,7 @@ Official list [D-tools]. "All tool names use the `agentaccess___` prefix." Appli
 | `type_text` | Type text by simulating key events for each character | `text` (req, ≤ 10,000 chars) | TypeText |
 | `key` | Press key or combination | `keys` (req; single key or `+`-joined, e.g. `a`, `ctrl+c`, `ctrl+shift+s`) | KeyPress |
 | `hold_key` | Hold key/combination for a duration | `keys` (req), `duration` (req, 1–30 s) | HoldKey |
-| `screenshot` | Capture desktop. "The returned image dimensions define the coordinate space for all mouse tools." | `include_cursor` (opt, default `false`) | GetScreenshot |
+| `screenshot` | Capture desktop; all mouse tools use the returned image's dimensions as their coordinate space [D-tools]. | `include_cursor` (opt, default `false`) | GetScreenshot |
 | `launch_application` | Launch an app from the fleet image catalog | `id` (req) | LaunchApplication |
 | `toggle_app_switcher` | Open/close app-switcher overlay | none | ToggleAppSwitcher |
 | `execute_sequence` | Run several tool calls in order | `actions` (req, list of action objects) | ExecuteSequence |
@@ -162,7 +164,7 @@ Additional documented semantics:
 - **get_session_info** [D-tools]:
   - Stack session fields: `mcpSessionId`, `stack`, `userId`, `workSpacesSessionId`, `fleet`. Image builder fields: `mcpSessionId`, `workSpacesSessionId`, `imageBuilder` (ARN).
   - It does **not** return a streaming URL. The agent's code creates one with `CreateStreamingURL(stack, fleet, userId)` or `CreateImageBuilderStreamingURL(name = last segment of the imageBuilder ARN)`.
-  - Then (verbatim) "read the `streaming_url` value from the `_meta` field of your MCP client … keeping it in `_meta` keeps it out of the model's context."
+  - Then retrieve `streaming_url` from the MCP client's `_meta` and open it in a browser; the URL embeds session credentials, so keeping it in `_meta` keeps it out of the model's context [D-tools].
   - Whether the server itself returns `_meta.streaming_url` on the get_session_info result is **ambiguous / UNKNOWN**. The Oct 20 note says you can "generate a link for real-time observability" [W-oct].
   - The result encoding (JSON text block vs `structuredContent`) and the exact types are UNKNOWN. Field names are documented.
 - **close_session** [D-tools, D-cleanup]:
@@ -282,7 +284,7 @@ Documented [D-cui]:
 
 - Selected by the `x-amzn-agentaccess-computer-use-interface-id` header on `tools/list` **and** every `tools/call`.
 - Per request, nothing stored. Omitted or empty means native tools. An unknown value returns **JSON-RPC -32602**.
-- The interface **replaces only the standard desktop tools**. Session tools, forwarded tools and application-catalog tools stay unchanged. The server converts each call into the underlying desktop actions.
+- The interface substitutes its tools for **standard desktop tools only**; it leaves session, forwarded and application-catalog tools unchanged. The server converts each call into the underlying desktop actions.
 
 | Header value | AWS label |
 |---|---|
@@ -410,7 +412,7 @@ Service contract from the sample's tester [S-fwd-contract, sample tester README]
 - execute_sequence: ≤ 20 actions, total wait ≤ 10 s, total text ≤ 10,000 chars, 60 s deadline [D-tools].
 - One agent per session, image builder, or named user per fleet [D-endpoint, D-prereq].
 - Not supported [D-prereq]: VPC endpoints, multi-session fleets, Elastic fleets, domain-joined image builders, app block builders, Linux image builders.
-- **Correction vs draft:** "an AI agent or a human can provide input, not both" is documented **for image builders only** [D-prereq].
+- **Correction vs earlier draft:** "an AI agent or a human can provide input, not both" is documented **for image builders only** [D-prereq].
 - Supported OSes: Windows Server, Linux (AWS base images), Windows 11 (BYOL) [D-prereq].
 - Image builders need an agent image released on or after Oct 25, 2026 (base image on or after Nov 4, 2026) [D-prereq].
 - Request rate limits / throttling: UNDOCUMENTED.
@@ -459,7 +461,7 @@ Service contract from the sample's tester [S-fwd-contract, sample tester README]
   - Management event `Initialize`.
   - Tool calls are **data events** named `CallReadOnlyTool` / `CallPrivilegedTool` [D-ident-ndj, D-ident-dj].
   - The Monitoring page instead says "one for each agentaccess-mcp action (for example GetScreenshot…)" [D-monitor].
-  - **Correction vs draft:** the event names are documented; the docs just describe them two ways.
+  - **Correction vs earlier draft:** the event names are documented; the docs just describe them two ways.
 - CloudWatch metrics: Invocations, Latency, ClientErrors, ServerErrors, McpSessionStart, McpSessionDuration [D-monitor]. Namespace and dimensions: UNDOCUMENTED.
 
 ## 14. Client setup examples (verbatim patterns)
@@ -542,4 +544,4 @@ Other AWS GitHub:
 - G-proxy: https://github.com/aws/mcp-proxy-for-aws (README: `--metadata` / `metadata` injects `_meta`)
 - No agentaccess server code was found in awslabs/mcp. The GitHub code-search API was rate-limited, so this check is not exhaustive.
 
-Local snapshots of every page used: `/workspace/tinyagentaccess/src/*.md`. Sample clone: `/workspace/tinyagentaccess/sample/`.
+The pages were read on Nov 16, 2026; the URLs above are the canonical sources. The sample repository was read at commit `19839c7`.

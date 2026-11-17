@@ -1,0 +1,38 @@
+ignore-dev-dependencies = true
+ignore-build-dependencies = false
+private = { ignore = true }
+
+# Keep this list identical to deny.toml's licenses.allow.
+accepted = [
+    "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause", "BSD-3-Clause", "Zlib", "Unicode-3.0",
+    "0BSD", "Unlicense", "IJG",
+]
+# no-clearly-defined = true: removed in cargo-about 0.9.3; it no longer uses
+# ClearlyDefined. The generation script also enforces --offline.
+targets = [
+    "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc",
+]
+
+# jpeg-encoder embeds the IJG terms in its DCT implementation, rather than a
+# root license file. Retain that notice and the crate's MIT/Apache terms.
+[jpeg-encoder.clarify]
+license = "(MIT OR Apache-2.0) AND IJG"
+
+[[jpeg-encoder.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "4d022727ea392ebba2fe5e9a5f78c610a0eae506b491f3db29c78b6d430d6503"
+
+[[jpeg-encoder.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "85a884980abd6032fc6b5439ba918ab16db9ac9051b5cf18db9c27c587df07c0"
+
+[[jpeg-encoder.clarify.files]]
+path = "src/fdct.rs"
+license = "IJG"
+checksum = "d80f4bea8e02b5fb261f47a4affceedea01348b70282fb0739edb2c9d9974825"
+start = "/*"
+end = " * assumed by the product vendor."

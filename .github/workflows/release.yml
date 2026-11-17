@@ -30,17 +30,31 @@ jobs:
           key: release-${{ matrix.target }}
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
         with:
-          tool: cargo-zigbuild@0.20.1
+          tool: cargo-zigbuild@0.24.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.13.0
       - name: Build CLI only
         run: cargo zigbuild --release --locked -p tinyagentaccess --bin tinyagentaccess --target ${{ matrix.target }}
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+        with:
+          tool: cargo-about@0.9.3
+      - name: Fetch dependencies for all release targets
+        run: cargo fetch --locked
+      - name: Generate dependency license bundle
+        shell: bash
+        run: bash scripts/third-party-licenses.sh
       - run: bash scripts/package.sh ${{ matrix.target }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: package-${{ matrix.target }}
           path: dist/*.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        with:
+          name: license-bundle
+          path: THIRD_PARTY_LICENSES.html
           if-no-files-found: error
   macos:
     if: github.event.repository.private == false
@@ -64,18 +78,60 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "12.3"
         run: cargo build --release --locked -p tinyagentaccess --bin tinyagentaccess --target ${{ matrix.target }}
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+        with:
+          tool: cargo-about@0.9.3
+      - name: Fetch dependencies for all release targets
+        run: cargo fetch --locked
+      - name: Generate dependency license bundle
+        shell: bash
+        run: bash scripts/third-party-licenses.sh
       - run: bash scripts/package.sh ${{ matrix.target }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: package-${{ matrix.target }}
           path: dist/*.tar.gz
           if-no-files-found: error
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: release-x86_64-pc-windows-msvc
+      - name: Build CLI only
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --locked -p tinyagentaccess --bin tinyagentaccess --target x86_64-pc-windows-msvc
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+        with:
+          tool: cargo-about@0.9.3
+      - name: Fetch dependencies for all release targets
+        run: cargo fetch --locked
+      - name: Generate dependency license bundle
+        shell: bash
+        run: bash scripts/third-party-licenses.sh
+      - name: Package Windows CLI
+        shell: bash
+        run: bash scripts/package.sh x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-x86_64-pc-windows-msvc
+          path: dist/*.zip
+          if-no-files-found: error
   publish:
-    needs: [linux, macos]
+    needs: [linux, macos, windows]
     # A skipped private macOS build must not suppress a manual Linux dry run.
     # Tag releases require every platform and a public repository.
     if: >-
-      always() && !cancelled() && needs.linux.result == 'success' &&
+      always() && !cancelled() && needs.linux.result == 'success' && needs.windows.result == 'success' &&
       ((github.event_name == 'workflow_dispatch' &&
         (needs.macos.result == 'success' || needs.macos.result == 'skipped')) ||
        (github.ref_type == 'tag' && github.event.repository.private == false &&
@@ -91,16 +147,20 @@ jobs:
           pattern: package-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: license-bundle
+          path: dist
       - name: Checksums
         working-directory: dist
-        run: sha256sum *.tar.gz > SHA256SUMS
+        run: sha256sum *.tar.gz *.zip THIRD_PARTY_LICENSES.html > SHA256SUMS
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         if: github.event.repository.private == false
       - name: Keyless signature bundles
         if: github.event.repository.private == false
         working-directory: dist
         run: |
-          for file in *.tar.gz SHA256SUMS; do
+          for file in *.tar.gz *.zip THIRD_PARTY_LICENSES.html SHA256SUMS; do
             cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
           done
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

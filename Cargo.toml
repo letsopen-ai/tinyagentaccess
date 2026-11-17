@@ -2,13 +2,13 @@
 resolver = "2"
 members = ["crates/*"]
 [workspace.package]
-version = "0.1.0-alpha.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 repository = "https://github.com/letsopen-ai/tinyagentaccess"
 license = "MIT"
 homepage = "https://github.com/letsopen-ai/tinyagentaccess#readme"
-authors = ["Nie Chen <git@cnie.xyz>"]
+authors = ["Chen Nie <git@cnie.xyz>"]
 description = "A local Rust MCP server for desktop capture, input, and tool forwarding."
 keywords = ["mcp", "computer-use", "agent", "desktop"]
 categories = ["command-line-utilities"]
