@@ -30,7 +30,7 @@ jobs:
           key: release-${{ matrix.target }}
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
         with:
-          tool: cargo-zigbuild@0.20.1
+          tool: cargo-zigbuild@0.24.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.13.0
