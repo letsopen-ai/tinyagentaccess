@@ -1,0 +1,6 @@
+# ScreenCaptureKit is strongly linked and requires macOS 12.3 or newer.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-mmacosx-version-min=12.3"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-mmacosx-version-min=12.3"]
