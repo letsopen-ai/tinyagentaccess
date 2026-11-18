@@ -323,7 +323,20 @@ Each following bullet is a separate **PROVISIONAL / TINY-PROPOSAL** local choice
   releases held buttons, removes ownership/session state and tears down forwarding.
   PROVISIONAL: AWS VIEW_STOP mid-action semantics are unknown. Stop marks the session stopping before waiting for the desktop lock. Sequences abort with a stopped error between steps; an admitted native action or wait may finish. Queued calls fail;
   queued requests recheck existence and fail after closure. No local image-builder
-  stop/start or OS logout exists. A new MCP session is required to resume.
+  stop/start or OS logout exists.
+  **TINY-PROPOSAL:** Stop closes only the targeted MCP session; it is not a lockout
+  and does not block new sessions. A new MCP session is required to resume. Legacy
+  transport sessions then get HTTP 404; the [MCP Streamable HTTP spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+  requires clients to start a new session after a 404 for a request carrying
+  `Mcp-Session-Id`, so a client may re-initialize and continue without the agent
+  noticing. Modern-dialect calls with the stopped `mcpSessionId` return an
+  `Unknown mcpSessionId` tool error, and the agent may continue by calling again with
+  `mcpSessionId: "NEW"`. To keep an agent off the desktop, stop the agent/MCP client
+  or the tinyAgentAccess server. `user_control_mode` controls observation and Stop
+  availability, not agent access.
+  AWS documents that on a stack the agent must start a new session to resume; on an
+  image builder agent access returns only after stop/start [D-session].
+  tinyAgentAccess has no image-builder lifecycle and follows the stack behavior.
 - **[D-session] Browser safety:** observer responses disable caching; the page denies
   framing and external resources. Existing Host/Origin checks also apply, with exact
   Origin/Host authority matching and a required Origin for Stop. Only GET `/observe`
