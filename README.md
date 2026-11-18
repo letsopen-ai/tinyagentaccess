@@ -5,7 +5,7 @@
 
 An open-source, self-hostable, local-first Rust rebuild of the Amazon WorkSpaces for AI agents MCP server. AWS-compatible native tool names, running on your own computer, with no AWS dependency.
 
-**v0.1.0:** desktop capture/input, sequences, forwarding, dialect adapters, local replay and human Stop.
+**v0.1.1:** desktop capture/input, sequences, forwarding, dialect adapters, local replay and human Stop.
 
 **Security: no authentication. Binds to localhost by default. Do not expose this server to a network or the public internet. Wildcard binds are rejected; concrete non-loopback binds warn. Host/Origin checks are not authentication.** Security: see [SECURITY.md](SECURITY.md).
 
@@ -46,7 +46,7 @@ have `.sigstore.json` signatures. For example:
 
 ```sh
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity "https://github.com/letsopen-ai/tinyagentaccess/.github/workflows/release.yml@refs/tags/v0.1.0" \
+  --certificate-identity "https://github.com/letsopen-ai/tinyagentaccess/.github/workflows/release.yml@refs/tags/v0.1.1" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 ```

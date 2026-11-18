@@ -4,6 +4,18 @@ All notable changes are recorded here in [Keep a Changelog](https://keepachangel
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-18
+
+### Fixed
+
+- macOS scroll reported success but missed the view under the requested coordinates: the wheel event inherited the sampled cursor location instead of `self.position`. The constructor now calls `CGEventSetLocation` ([#12](https://github.com/letsopen-ai/tinyagentaccess/pull/12)).
+- The macOS Rust FFI declared `wheel1` as variadic, contrary to `CGEvent.h` (`int32_t wheel1, ...`), producing a garbage one-notch `NSEvent.scrollingDeltaY` of `-24760` on Apple ARM64. It now uses non-variadic `CGEventCreateScrollWheelEvent2` ([#12](https://github.com/letsopen-ai/tinyagentaccess/pull/12)).
+
+### Changed
+
+- Moved macOS CI to standard GitHub-hosted runners ([#10](https://github.com/letsopen-ai/tinyagentaccess/pull/10)).
+- Clarified that observer Stop ends one MCP session and is not a lockout ([#11](https://github.com/letsopen-ai/tinyagentaccess/pull/11)).
+
 ## [0.1.0] - 2026-11-17
 
 ### Added
@@ -23,6 +35,7 @@ All notable changes are recorded here in [Keep a Changelog](https://keepachangel
 
 - Prepared community documentation, crate metadata, dependency license checks, and CI/release packaging.
 
-[Unreleased]: https://github.com/letsopen-ai/tinyagentaccess/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/letsopen-ai/tinyagentaccess/compare/v0.1.1...HEAD
 
+[0.1.1]: https://github.com/letsopen-ai/tinyagentaccess/releases/tag/v0.1.1
 [0.1.0]: https://github.com/letsopen-ai/tinyagentaccess/releases/tag/v0.1.0
