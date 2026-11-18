@@ -60,10 +60,20 @@ unsafe extern "C" {
     fn CGEventCreateMouseEvent(s: Ref, kind: u32, p: CGPoint, button: u32) -> Ref;
     fn CGEventCreateKeyboardEvent(s: Ref, key: u16, down: bool) -> Ref;
     fn CGEventKeyboardSetUnicodeString(e: Ref, len: usize, text: *const u16);
+    #[cfg(test)]
+    fn CGEventGetIntegerValueField(e: Ref, field: u32) -> i64;
     fn CGEventSetIntegerValueField(e: Ref, field: u32, value: i64);
     fn CGEventSetFlags(e: Ref, flags: u64);
+    fn CGEventSetLocation(e: Ref, p: CGPoint);
     fn CGEventPost(tap: u32, e: Ref);
-    fn CGEventCreateScrollWheelEvent(s: Ref, units: u32, count: u32, ...) -> Ref;
+    fn CGEventCreateScrollWheelEvent2(
+        s: Ref,
+        units: u32,
+        count: u32,
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
+    ) -> Ref;
 }
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -180,6 +190,19 @@ struct Desktop {
     left_down: bool,
 }
 impl Desktop {
+    fn wheel_event(&self, vertical: i32, horizontal: i32) -> Ref {
+        unsafe {
+            // SDK CGEvent.h: fixed-argument API since macOS 10.13; line units = 1.
+            let e =
+                CGEventCreateScrollWheelEvent2(std::ptr::null_mut(), 1, 2, vertical, horizontal, 0);
+            if !e.is_null() {
+                CGEventSetLocation(e, self.position);
+                CGEventSetFlags(e, self.flags);
+            }
+            e
+        }
+    }
+
     fn new() -> Self {
         unsafe {
             let d = CGMainDisplayID();
@@ -389,13 +412,7 @@ impl Input for Desktop {
             ScrollDirection::Left => (0, n),
             ScrollDirection::Right => (0, -n),
         };
-        unsafe {
-            let e = CGEventCreateScrollWheelEvent(std::ptr::null_mut(), 1, 2, v, h);
-            if !e.is_null() {
-                CGEventSetFlags(e, self.flags);
-            }
-            post(e)
-        }
+        post(self.wheel_event(v, h))
     }
     fn text(&mut self, t: &str) -> Result<(), String> {
         for c in t.chars() {
@@ -424,6 +441,40 @@ impl Input for Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Regression diagnostic for the construction-location mismatch observed on macOS.
+    // No event is posted and no cursor movement or capture is requested.
+    #[test]
+    #[ignore = "requires macOS CoreGraphics; checks construction only, not AppKit delivery"]
+    fn wheel_location_matches_requested_position() {
+        let mut desktop = Desktop::new();
+        // Deliberately differ from the sampled cursor location, so inheriting
+        // global cursor state cannot accidentally satisfy the target assertion.
+        desktop.position.x += 37.0;
+        desktop.position.y += 53.0;
+        let e = desktop.wheel_event(-1, 0);
+        assert!(!e.is_null(), "CoreGraphics could not create wheel event");
+        let actual = unsafe {
+            let p = CGEventGetLocation(e);
+            // SDK CGEventTypes.h: kCGScrollWheelEventDeltaAxis1/2 = 11/12.
+            let axes = (
+                CGEventGetIntegerValueField(e, 11),
+                CGEventGetIntegerValueField(e, 12),
+            );
+            CFRelease(e);
+            (p, axes)
+        };
+        assert_eq!(
+            actual.1,
+            (-1, 0),
+            "wheel axes must equal requested line deltas"
+        );
+        assert_eq!(
+            (actual.0.x, actual.0.y),
+            (desktop.position.x, desktop.position.y),
+            "wheel location must equal the requested CGEvent position"
+        );
+    }
+
     #[test]
     fn named_mapping_audit() {
         for name in crate::keys::SPECIAL_NAMES {
