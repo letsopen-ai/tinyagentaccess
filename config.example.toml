@@ -6,6 +6,11 @@ forward_mcp_tools = false # enable stdio tools from the redirection config (forw
 screen_resolution = "1280x720" # or "native"
 screen_image_format = "png" # png | jpeg
 user_control_mode = "disabled" # view_only | view_stop | disabled; local /observe UI, unauthenticated
+# TINY-PROPOSAL: Stop closes only the selected MCP session, releases input and ends forwarding.
+# It does not block new sessions; clients/agents may start a new one after the stopped session is rejected:
+# https://modelcontextprotocol.io/specification/2025-11-25/basic/transports
+# To keep an agent off the desktop, stop the agent/MCP client or tinyAgentAccess server.
+# This mode controls observation/Stop availability, not agent access.
 [sessions]
 max_sessions = 1
 idle_timeout_secs = 780

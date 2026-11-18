@@ -176,9 +176,18 @@ Open `http://127.0.0.1:8765/observe` on the same origin as the server. `view_onl
 shows session selection and fresh screenshots; `view_stop` also shows Stop. `disabled`
 returns 404 for observer routes. All local sessions share one desktop; selection
 chooses which session to observe or close, not a separate OS desktop. Polling uses
-the normal capture path and may require OS consent. Stop releases held input and
+the normal capture path and may require OS consent. Stop releases held input, ends forwarding, and
 marks the session stopping immediately and closes it after the admitted action finishes. Sequences check Stop between steps (PROVISIONAL; AWS mid-action semantics unknown). Observation does not reset the idle timer. Queued calls
-then fail like calls after normal closure; the agent must create a new session.
+then fail like calls after normal closure. **TINY-PROPOSAL:** Stop closes only the
+targeted MCP session; it is not a lockout and does not block new sessions. Legacy
+transport sessions then get HTTP 404; the [MCP Streamable HTTP spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+requires clients to start a new session after a 404 for a request carrying
+`Mcp-Session-Id`, so a client may re-initialize and continue without the agent
+noticing. Modern-dialect calls with the stopped `mcpSessionId` return an
+`Unknown mcpSessionId` tool error, and the agent may continue by calling again with
+`mcpSessionId: "NEW"`. To keep an agent off the desktop, stop the agent/MCP client
+or the tinyAgentAccess server. `user_control_mode` controls observation and Stop
+availability, not agent access.
 No `client_disconnected` notification is emitted: its AWS wire form is unknown.
 
 The observer is an **unauthenticated local substitute, not AWS DCV**. Keep the bind
