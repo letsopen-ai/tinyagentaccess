@@ -11,6 +11,7 @@ mod macos_capture;
 #[cfg(any(target_os = "macos", test))]
 mod macos_keys;
 pub mod pixels;
+pub mod preflight;
 #[cfg(target_os = "linux")]
 mod wayland;
 #[cfg(windows)]

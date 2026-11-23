@@ -79,6 +79,17 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
+// doctor-preflight-begin
+// No-prompt queries only; used by `preflight::macos` for `tinyagentaccess doctor`.
+pub(crate) fn preflight_screen_recording() -> bool {
+    // SAFETY: query-only; never shows a consent prompt.
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+pub(crate) fn preflight_accessibility() -> bool {
+    // SAFETY: the plain form never prompts.
+    unsafe { AXIsProcessTrusted() }
+}
+// doctor-preflight-end
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(p: Ref);

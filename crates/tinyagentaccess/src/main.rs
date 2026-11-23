@@ -1,3 +1,6 @@
+mod doctor;
+mod procchain;
+const DOCTOR_HELP: &str = "tinyagentaccess doctor [--json]\n\nPrint read-only diagnostics: version, binary path and SHA-256, parent process chain,\nlikely host app, session hints, and (macOS) Screen Recording / Accessibility preflight.\nNever prompts or changes anything.\n\nExit codes: 0 ok or not applicable, 1 macOS permission preflight failed, 2 usage or doctor error.";
 use std::path::PathBuf;
 use taa_tools::config::Config;
 #[tokio::main]
@@ -5,12 +8,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "--help".into());
     if matches!(command.as_str(), "--help" | "-h") {
-        println!("tinyAgentAccess\n\nUsage: tinyagentaccess serve [--config <path>] [--bind <addr>]\n       tinyagentaccess print-config\n       tinyagentaccess --version");
+        println!("tinyAgentAccess\n\nUsage: tinyagentaccess serve [--config <path>] [--bind <addr>]\n       tinyagentaccess print-config\n       tinyagentaccess doctor [--json]\n       tinyagentaccess --version");
         return Ok(());
     }
     if matches!(command.as_str(), "--version" | "-V") {
         println!("tinyagentaccess {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if command == "doctor" {
+        match doctor::parse_args(args) {
+            Err(e) => {
+                eprintln!("error: {e}\n{DOCTOR_HELP}");
+                std::process::exit(2);
+            }
+            Ok(o) if o.help => {
+                println!("{DOCTOR_HELP}");
+                std::process::exit(0);
+            }
+            Ok(o) => std::process::exit(doctor::run(&o)),
+        }
     }
     if command == "print-config" {
         print!("{}", toml::to_string_pretty(&Config::default())?);
