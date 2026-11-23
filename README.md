@@ -35,6 +35,7 @@ and the MIT-0 sample; this is not an official AWS product.
 - Retina, multi-monitor, denied-permission, and real GNOME/KDE Wayland behavior are not fully verified.
 - Dialect schemas and forwarded-tool behavior with an unknown interface header are provisional.
 - AWS mid-sequence Stop semantics are unknown; local sequences check Stop between steps.
+- Two servers that both capture at once have been observed to hit a 10 s ScreenCaptureKit timeout on macOS. The cause is unconfirmed; this is not a proven product bug.
 
 ### Release archives
 
@@ -66,6 +67,51 @@ cargo run -p tinyagentaccess -- serve
 # Optional: --config config.example.toml --bind 127.0.0.1:8765
 cargo run -p tinyagentaccess -- print-config
 ```
+
+### macOS first run
+
+macOS Screen Recording and Accessibility permissions belong to the host app (the terminal or app that launches the server), not to a Rust source file. A new binary path or a new binary may need a new grant. The release and source builds are not notarized, so macOS may show Gatekeeper / unidentified-developer warnings.
+
+Before starting the server, check what macOS will see:
+
+```sh
+tinyagentaccess doctor
+tinyagentaccess doctor --json
+```
+
+`doctor` is read-only. It reports the version, the absolute path and SHA-256 of the running binary, the parent process chain with a guess at the host app, SSH / non-GUI hints, a remedy, and on macOS the no-prompt Screen Recording and Accessibility preflight results and whether ScreenCaptureKit is available. It never prompts, never opens System Settings, never reads `TCC.db`, never changes grants, and does not capture, post input, or bind a port. Exit code 0 means the checks passed or do not apply on this OS, 1 means a macOS permission preflight failed, and 2 means a usage or doctor error. With `--json`, stdout is a single JSON object.
+
+After granting access, quit and restart the host app and then the server. Capture needs an unlocked interactive desktop; an SSH or other non-GUI session may not see the logged-in desktop. See [permissions](docs/permissions.md#macos).
+
+### OpenCode (loopback)
+
+Start the server first, then point OpenCode at its `/mcp` endpoint:
+
+```sh
+tinyagentaccess serve   # listens on 127.0.0.1:8765
+```
+
+Add this to your OpenCode config (for example `opencode.json`). The shape follows the official [OpenCode MCP server docs](https://opencode.ai/docs/mcp-servers/): `mcp.servers.<name>` with `"type": "remote"` and an absolute Streamable HTTP `url`. The name `taa` is only a label.
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "taa": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8765/mcp",
+        "oauth": false
+      }
+    }
+  }
+}
+```
+
+- OpenCode's docs say remote servers use OAuth by default and document `"oauth": false` to disable it. tinyAgentAccess has no authentication, so `"oauth": false` is appropriate here.
+- **This server has no authentication. Keep it on loopback** and do not point OpenCode at a non-loopback address.
+- Tested with OpenCode v2.1.2 in Code Mode against a scratch loopback port (18776; the default 8765 is documented above). OpenCode exposed the tools as `tools.taa.agentaccess___...`, using the configured server name `taa`. In the same test, direct-list mode (`codemode: false`) did not expose usable tools even though the server showed as connected, so Code Mode is the tested path.
+- OpenCode does not ship an official tinyAgentAccess template; this is a user-side config. Other OpenCode options (timeouts, headers, and so on) were not tested.
 
 Stateful curl smoke test (requires Python 3 to extract the session header):
 
