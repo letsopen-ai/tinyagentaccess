@@ -538,9 +538,62 @@ mod tests {
         assert!(hints(&f).iter().any(|h| h.contains("sshd ancestor")));
     }
 
+    /// Normalizes CRLF (Windows checkouts) to LF so marker searches are
+    /// line-ending independent.
+    fn lf(src: &str) -> String {
+        src.replace("\r\n", "\n")
+    }
+
+    /// Finds `needle` in `hay`, naming the needle on failure.
+    fn find_or_panic(hay: &str, needle: &str) -> usize {
+        hay.find(needle)
+            .unwrap_or_else(|| panic!("scan marker not found: {needle:?}"))
+    }
+
     /// Production code only: everything before the `mod tests` module.
+    /// Input must already be LF-normalized.
     fn prod(src: &str) -> &str {
-        src.split("#[cfg(test)]\nmod tests").next().unwrap()
+        &src[..find_or_panic(src, "#[cfg(test)]\nmod tests")]
+    }
+
+    /// The `if command == "doctor" { ... }` dispatch block of `main.rs`.
+    /// Input must already be LF-normalized.
+    fn doctor_dispatch(main: &str) -> &str {
+        let b = find_or_panic(main, "if command == \"doctor\" {");
+        let e = b + find_or_panic(&main[b..], "\n    }\n");
+        &main[b..e]
+    }
+
+    /// The scan markers must keep working if sources are checked out with
+    /// CRLF, so this cannot regress only on Windows.
+    #[test]
+    fn doctor_scan_markers_survive_crlf_sources() {
+        for raw in [
+            include_str!("doctor.rs"),
+            include_str!("procchain.rs"),
+            include_str!("main.rs"),
+        ] {
+            let crlf = raw.replace("\r\n", "\n").replace('\n', "\r\n");
+            // Raw CRLF text defeats the LF-only needles; normalization fixes it.
+            assert!(!crlf.contains("#[cfg(test)]\nmod tests"));
+            let norm = lf(&crlf);
+            assert_eq!(norm, lf(raw));
+            if norm.contains("#[cfg(test)]\nmod tests") {
+                assert!(prod(&norm).len() < norm.len());
+            }
+        }
+        let main_crlf = include_str!("main.rs")
+            .replace("\r\n", "\n")
+            .replace('\n', "\r\n");
+        assert!(!main_crlf.contains("\n    }\n"));
+        let norm = lf(&main_crlf);
+        assert!(doctor_dispatch(&norm).contains("doctor::run"));
+        let doctor_crlf = include_str!("doctor.rs")
+            .replace("\r\n", "\n")
+            .replace('\n', "\r\n");
+        let doctor_norm = lf(&doctor_crlf);
+        // The test module must be excluded from the production slice.
+        assert!(!prod(&doctor_norm).contains("fn doctor_sources_have_no_prompt_apis"));
     }
 
     /// The doctor path must never reach request/prompt APIs, input, capture,
@@ -565,19 +618,15 @@ mod tests {
             "fs::write",
             "File::create",
         ];
-        let main = include_str!("main.rs");
-        let b = main.find("if command == \"doctor\" {").unwrap();
-        let e = b + main[b..].find("\n    }\n").unwrap();
-        let doctor_src = include_str!("doctor.rs");
+        let main = lf(include_str!("main.rs"));
+        let doctor_all = lf(include_str!("doctor.rs"));
+        let procchain_all = lf(include_str!("procchain.rs"));
+        let doctor_src = prod(&doctor_all);
         // Guard against the scan silently shrinking again.
-        assert!(prod(doctor_src).contains("pub fn run("));
-        assert!(prod(doctor_src).contains("fn hash_file"));
-        assert!(prod(doctor_src).contains("pub fn render_text"));
-        for src in [
-            prod(doctor_src),
-            prod(include_str!("procchain.rs")),
-            &main[b..e],
-        ] {
+        assert!(doctor_src.contains("pub fn run("));
+        assert!(doctor_src.contains("fn hash_file"));
+        assert!(doctor_src.contains("pub fn render_text"));
+        for src in [doctor_src, prod(&procchain_all), doctor_dispatch(&main)] {
             for b in BANNED {
                 assert!(!src.contains(b), "forbidden `{b}` in doctor path");
             }
