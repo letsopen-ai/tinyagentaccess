@@ -35,7 +35,7 @@ and the MIT-0 sample; this is not an official AWS product.
 - Retina, multi-monitor, denied-permission, and real GNOME/KDE Wayland behavior are not fully verified.
 - Dialect schemas and forwarded-tool behavior with an unknown interface header are provisional.
 - AWS mid-sequence Stop semantics are unknown; local sequences check Stop between steps.
-- Two servers that both capture at once have been observed to hit a 10 s ScreenCaptureKit timeout on macOS. The cause is unconfirmed; this is not a proven product bug.
+- Run at most one capturing tinyagentaccess server per macOS desktop session. In a real-Mac isolation run (2026-11-24, loopback only), repeated and overlapping captures in one process were reliable, and a second server that was only listening did not interfere. Once a second process attempted a capture after another had already captured, that attempt hit the 10 s ScreenCaptureKit timeout (`ScreenCaptureKit capture timed out after 10 seconds`), and later captures in both processes timed out until both were restarted; after both test processes were stopped, a fresh single server captured normally. The same pattern held in reverse order. This is a documented local deployment limitation, not a proven tinyagentaccess code bug, and the failing Apple API stage was not isolated; there is no in-tree fix or cross-process lock.
 
 ### Release archives
 
