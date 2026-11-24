@@ -7,7 +7,11 @@ All notable changes are recorded here in [Keep a Changelog](https://keepachangel
 ### Added
 
 - Read-only `tinyagentaccess doctor [--json]` command that reports the version, binary path and SHA-256, parent process chain and likely host app, SSH / non-GUI hints, a remedy, and on macOS the no-prompt Screen Recording and Accessibility preflight results and ScreenCaptureKit availability. Exit codes: 0 pass or not applicable, 1 macOS preflight failed, 2 usage or doctor error.
-- Documentation: macOS first-run guidance (host-app permissions, non-notarized build, restart after granting), an OpenCode loopback config for `http://127.0.0.1:8765/mcp`, and a README known-issue note about an unconfirmed 10 s ScreenCaptureKit timeout with two capturing servers.
+- Documentation: macOS first-run guidance (host-app permissions, non-notarized build, restart after granting), an OpenCode loopback config for `http://127.0.0.1:8765/mcp`, and a README known-issue note about the 10 s ScreenCaptureKit timeout when two servers capture (see Changed).
+
+### Changed
+
+- Documentation: the two-capturing-servers ScreenCaptureKit timeout is now confirmed by a real-Mac isolation run (2026-11-24). Run at most one capturing server per desktop session. In that run, a second process that attempted capture after another had already captured timed out after 10 s and left both processes unable to capture until restarted. Documented as a deployment limitation, not a proven code bug; no code change.
 
 ### Fixed
 
