@@ -21,6 +21,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+subtle = "2"
+getrandom = "0.3"
 taa-platform = { path = "crates/taa-platform" }
 taa-tools = { path = "crates/taa-tools" }
 taa-mcp = { path = "crates/taa-mcp" }

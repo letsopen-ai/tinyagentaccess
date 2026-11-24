@@ -101,14 +101,9 @@ async fn select_monitor(
     Ok(())
 }
 fn token_path() -> Result<PathBuf, String> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/state")))
-        .ok_or("no absolute state directory; restore token disabled")?;
-    if !base.is_absolute() {
-        return Err("state directory must be absolute; restore token disabled".into());
-    }
-    Ok(base.join("tinyagentaccess/portal-restore-token"))
+    crate::state_dir()
+        .map(|d| d.join("portal-restore-token"))
+        .map_err(|e| format!("{e}; restore token disabled"))
 }
 fn save_token(token: &str) -> Result<(), String> {
     save_token_at(&token_path()?, token)

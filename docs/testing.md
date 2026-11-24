@@ -12,7 +12,7 @@ cargo test -p taa-tools --test x11_e2e -- --ignored --nocapture
 
 The test finds a free display in :120…:219, starts a 1920×1080 Xvfb with TCP disabled, creates a colored input-recording x11rb window, and runs real screenshot/click/text/combo/scroll/drag tools. It decodes the 1280×720 PNG and checks pixels on both sides of each window edge, checks independent expected root coordinates, observes ASCII and a temporarily mapped CJK keysym, Control state, wheel button counts, drag motion and release, complete spare-keycode restoration, cleanup after an unavailable combo, release after a mid-hold keymap change, and reconnect after X server restart. It kills and waits for Xvfb on scope exit. No global DISPLAY mutation is needed. CI installs Xvfb and runs this ignored test explicitly on Ubuntu.
 
-Manual HTTP smoke: start `Xvfb :98 -screen 0 1920x1080x24 -nolisten tcp`, then `DISPLAY=:98 XDG_SESSION_TYPE=x11 cargo run -p tinyagentaccess -- serve`. Use the README initialization/curl flow and call `agentaccess___screenshot` and `agentaccess___left_click` with x=640,y=360. Decode the base64 image: PNG header dimensions must be 1280×720. `DISPLAY=:98 xdotool getmouselocation` should report x=960,y=540. Stop both processes afterwards. Run `/tmp/mcpvenv/bin/python scripts/interop_python_sdk.py` against that server (or a venv with mcp==2.1.1).
+Manual HTTP smoke: start `Xvfb :98 -screen 0 1920x1080x24 -nolisten tcp`, then `DISPLAY=:98 XDG_SESSION_TYPE=x11 cargo run -p tinyagentaccess -- serve`. Use the README initialization/curl flow (it needs the bearer token; the first `serve` creates it and prints its path) and call `agentaccess___screenshot` and `agentaccess___left_click` with x=640,y=360. Decode the base64 image: PNG header dimensions must be 1280×720. `DISPLAY=:98 xdotool getmouselocation` should report x=960,y=540. Stop both processes afterwards. Run `TAA_TOKEN=<token from the printed file> /tmp/mcpvenv/bin/python scripts/interop_python_sdk.py` (or `--token-file`) against that server (or a venv with mcp==2.1.1).
 
 ## GNOME and KDE Wayland manual acceptance
 
@@ -84,7 +84,8 @@ For an already running configured server:
 
 ```sh
 MCP_PYTHON=/tmp/mcpvenv/bin/python
-"$MCP_PYTHON" scripts/interop_forwarding.py --url http://127.0.0.1:8765/mcp
+TAA_TOKEN=$(cat ~/.local/state/tinyagentaccess/mcp-token) \
+  "$MCP_PYTHON" scripts/interop_forwarding.py --url http://127.0.0.1:8765/mcp
 ```
 
 The redirection entry must be named `fixture`, command must be the absolute path to

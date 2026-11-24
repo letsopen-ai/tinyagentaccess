@@ -1,6 +1,6 @@
 # tinyAgentAccess design (milestones 1–7)
 
-This is a local implementation, with no AWS SDK, credentials, cloud connection, TLS stack, or authentication. The evidence source is [aws-parity.md](aws-parity.md); this document records implementation choices, not additional claims about AWS.
+This is a local implementation, with no AWS SDK, credentials, cloud connection, or TLS stack. It has a local bearer-token authentication layer (see [Authentication](#authentication)) that is not AWS auth. The evidence source is [aws-parity.md](aws-parity.md); this document records implementation choices, not additional claims about AWS.
 
 ## Architecture and request flow
 
@@ -24,7 +24,7 @@ Stateless calls require `arguments.mcpSessionId`. NEW creates a desktop session;
 
 ## Security
 
-Default bind is `127.0.0.1:8765`. `--bind` overrides TOML. Wildcard binds (`0.0.0.0` and `::`) fail configuration validation with a no-auth safety error; use a concrete IP socket address. A concrete non-loopback bind is allowed and emits a loud no-auth warning. Host must name localhost, a loopback IP, or the explicitly bound non-loopback IP. Arbitrary DNS names are rejected to reduce DNS rebinding exposure. Origin, if present, must use http/https and a loopback IP or localhost authority; other origins, null, userinfo, paths, and duplicate Host/Origin headers return 403. POST requires Content-Type application/json (parameters allowed), returning 415 otherwise. This JSON-response-only server requires Accept application/json (application/* and */* allowed), returning 406 otherwise; SSE acceptance is not required, matching the SDK JSON-response mode. Duplicate or non-UTF-8 routing headers and duplicate Content-Type return 400. Host/Origin remain 403 (an intentional difference from the SDK’s 421 for bad Host). Unknown AWS headers and query parameters are ignored. These checks do not authenticate local clients. Never expose this server.
+Default bind is `127.0.0.1:8765`. `--bind` overrides TOML. Wildcard binds (`0.0.0.0` and `::`) are always rejected by configuration validation (a wildcard exposes the server on every interface, even with the bearer token and opt-in); use a concrete IP socket address. A concrete non-loopback bind is rejected unless `--allow-non-loopback` / `[auth] allow_non_loopback` is set, and then it emits a loud no-TLS warning. Host must name localhost, a loopback IP, or the explicitly bound non-loopback IP. Arbitrary DNS names are rejected to reduce DNS rebinding exposure. Origin, if present, must use http/https and a loopback IP or localhost authority; other origins, null, userinfo, paths, and duplicate Host/Origin headers return 403. POST requires Content-Type application/json (parameters allowed), returning 415 otherwise. This JSON-response-only server requires Accept application/json (application/* and */* allowed), returning 406 otherwise; SSE acceptance is not required, matching the SDK JSON-response mode. Duplicate or non-UTF-8 routing headers and duplicate Content-Type return 400. Host/Origin remain 403 (an intentional difference from the SDK’s 421 for bad Host). Unknown AWS headers and query parameters are ignored. These checks do not authenticate local clients; the bearer token (Authentication) is checked in addition. Never expose this server.
 
 ## Registry, validation, outputs and errors
 
@@ -114,7 +114,7 @@ Native key availability depends on the hardware/keymap. Fn uses a private intern
 
 ## Roadmap
 
-M3 sequences and screenshot saving, M4 stdio MCP forwarding, M5 five computer-use adapters, and M7 local replay and human stop button are implemented. Authentication comes later. Windows SendInput/GDI is included in M2 rather than deferred to M6; DXGI remains optional future work.
+M3 sequences and screenshot saving, M4 stdio MCP forwarding, M5 five computer-use adapters, and M7 local replay and human stop button are implemented. Bearer-token authentication was added after M7 (see Authentication). Windows SendInput/GDI is included in M2 rather than deferred to M6; DXGI remains optional future work.
 
 ## MCP tool forwarding (M4)
 
@@ -347,8 +347,22 @@ Each following bullet is a separate **PROVISIONAL / TINY-PROPOSAL** local choice
   Sec-Fetch-Mode and Sec-Fetch-Dest, when present, must be `navigate` and `document`.
   The page rejects `cross-site` and `same-site` navigation and embedding. Polling,
   session listing and Stop still require `same-origin` when Sec-Fetch-Site is present.
-  All observer routes require a loopback Host. No auth is added;
-  these are browser checks, not identity. Keep the unauthenticated bind on loopback.
+  All observer routes require a loopback Host. These are browser checks, not
+  identity; the observer API additionally requires the separate observer secret
+  (Authentication). The page itself is served without it. Keep the bind on loopback.
 - **[S-retry, D-session] Disconnect notification:** no `client_disconnected` wire
   message is emitted because its exact shape is UNKNOWN and GET/SSE is unsupported.
   Session closure works independently, preserving close_session and HTTP DELETE.
+
+## Authentication
+
+**TINY-PROPOSAL.** AWS AgentAccess uses SigV4/IAM (see [aws-parity.md](aws-parity.md)); that cannot map to self-hosting, and this is not AWS protocol parity. Decisions are the resolved table in the internal auth design note (24 Nov 2026). `docs/aws-parity.md` §12 still says v1 ships without auth; it was intentionally not edited and needs a maintainer-authorized update.
+
+- **Agent token:** every `/mcp` request (POST, GET, DELETE) needs exactly one `Authorization: Bearer <token>`; scheme is case-insensitive, compare is constant time, no query-string tokens. Enforced in middleware before the 2 MiB body is read. 401 carries no `WWW-Authenticate` or `resource_metadata` so MCP clients are not pushed into OAuth discovery. Host/Origin checks stay 403 and both must pass.
+- **Token file:** 32 random bytes as 64 lowercase hex characters plus an optional single trailing newline, at the state directory (`$XDG_STATE_HOME` or `~/.local/state`, or `%LOCALAPPDATA%`) `/tinyagentaccess/mcp-token`; one shared user-level token. Directory `0700`; file created with `create_new` and `0600` (Windows: owner-only ACL set at creation). Existing files readable by group/other are refused. An explicit `--token-file` or `[auth] token_file` must exist and is never created. First-time creation writes and syncs an owner-only sibling temp file and publishes it with a hard link (Unix) or move-without-replace (Windows), so concurrent first starters never see a partial file and never overwrite a winner. `rotate-token` writes a sibling temp file and renames it. On Windows an existing file must be owned by the current user; allow ACEs are limited to the current user, SYSTEM, Administrators, and OWNER RIGHTS (trusted only after the owner check).
+- **Fail closed:** missing or unreadable named `--config`, unreadable token file, or loosely permissioned token file stops startup. No no-auth mode or environment bypass. The server reads the files itself and never puts a token in its environment or logs; it logs paths. Because users export `TAA_TOKEN` for clients, the forward launcher removes `TAA_TOKEN` from forwarded children (they can still read the 0600 file).
+- **Observer secret:** separate `observe-token` beside the agent token, used by `/observe/sessions`, `/observe/latest/{id}` and `/observe/stop/{id}` as `X-TAA-Observe-Token` (401 when missing, wrong, or duplicated, after Host/Origin/Fetch-Metadata pass). It is delivered in the `/observe#<secret>` URL fragment (printed once at startup and by `observe-url`), read from `location.hash` by the page, never in a query string or cookie. `GET /observe` (the page) needs only the browser checks. Responses send `Referrer-Policy: no-referrer`. The two secrets are not interchangeable: startup and `observe-url` reject the same path, a symlink or hard link to the same file, and equal values (constant-time compare), before any URL is printed. The observer accepts only loopback Host headers even for a concrete non-loopback bind, so `serve` and `observe-url` print the loopback URL plus an SSH-forward note for such binds.
+- **Bind policy:** loopback default; wildcard rejected; concrete non-loopback requires the token plus opt-in and still warns (no TLS). The supported remote path is an SSH local forward.
+- **Stop is not a lockout:** it does not rotate or revoke the token.
+- **Out of scope:** OAuth 2.1, stdio transport, TLS, Unix sockets, per-tool roles. Residual risk: same-user processes, including the agent's shell, can read the token.
+- **Doctor:** reports the default token path, existence, and owner-only status; never creates, rotates, or prints a token.

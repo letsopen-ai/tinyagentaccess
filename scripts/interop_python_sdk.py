@@ -1,10 +1,39 @@
 #!/usr/bin/env python3
-"""Wire compatibility check; install mcp==2.1.1 and run against `serve`."""
+"""Wire compatibility check; install mcp==2.1.1 and run against `serve`.
+
+/mcp requires a bearer token. Set TAA_TOKEN in this client process (never in
+the server's environment) or pass --token-file. The token goes in an
+`Authorization: Bearer` header on an httpx2 client handed to the transport;
+mcp==2.1.1's streamable_http_client has no `headers=` parameter.
+"""
 import argparse
 import asyncio
 import json
+import os
+import sys
+import httpx2
 from mcp.client import Client
 from mcp.client.streamable_http import streamable_http_client
+
+
+def load_token(token_file=None):
+    """Token from --token-file, else the TAA_TOKEN environment variable."""
+    if token_file:
+        with open(token_file, encoding="ascii") as handle:
+            token = handle.read().strip()
+    else:
+        token = os.environ.get("TAA_TOKEN", "").strip()
+    if not token:
+        sys.exit("error: set TAA_TOKEN or pass --token-file (see README, Authentication)")
+    return token
+
+
+def bearer_client(token):
+    return httpx2.AsyncClient(
+        headers={"Authorization": f"Bearer {token}"},
+        follow_redirects=True,
+        timeout=httpx2.Timeout(30.0, read=300.0),
+    )
 
 
 def session_id(result):
@@ -19,9 +48,11 @@ def session_id(result):
     raise AssertionError("missing mcpSessionId text block")
 
 
-async def run(url):
+async def run(url, token):
     for mode in ["legacy", "2026-07-28"]:
-        async with Client(streamable_http_client(url), mode=mode) as client:
+        async with bearer_client(token) as http, Client(
+            streamable_http_client(url, http_client=http), mode=mode
+        ) as client:
             tools = await client.list_tools()
             names = {tool.name for tool in tools.tools}
             assert "agentaccess___wait" in names
@@ -60,4 +91,6 @@ async def run(url):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8765/mcp")
-    asyncio.run(run(parser.parse_args().url))
+    parser.add_argument("--token-file", help="read the token here instead of TAA_TOKEN")
+    args = parser.parse_args()
+    asyncio.run(run(args.url, load_token(args.token_file)))

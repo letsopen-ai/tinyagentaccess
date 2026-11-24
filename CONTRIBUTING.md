@@ -26,7 +26,7 @@ Run `cargo fmt --all` to format changes. The local dependency license gate is
 `cargo deny check licenses` with [deny.toml](deny.toml).
 Documentation-only changes may use `git diff --check` plus factual and link review.
 
-This server has **no authentication**. Testers must bind loopback and keep screen
+Every `/mcp` request needs a bearer token read from an owner-only (0600) file, and the observer has its own secret; there is no no-auth mode. The server binds loopback by default, and a non-loopback bind needs `--allow-non-loopback` and still warns about missing TLS. Testers must keep loopback and keep screen
 captures, replay data, credentials, and personal configuration out of contributions.
 X11 needs access to the graphical session; Wayland needs portal consent and remains
 experimental. macOS needs Screen Recording and Accessibility permissions. Windows

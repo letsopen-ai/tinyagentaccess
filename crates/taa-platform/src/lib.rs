@@ -19,6 +19,27 @@ mod windows;
 #[cfg(target_os = "linux")]
 pub mod x11;
 pub use keys::{Key, KeyCombo};
+/// User-level state directory shared by the portal restore token and the
+/// authentication files: `<state>/tinyagentaccess`.
+///
+/// Unix and macOS: `$XDG_STATE_HOME` when it is absolute, else
+/// `~/.local/state`. Windows: `%LOCALAPPDATA%` when absolute. Relative or
+/// missing bases are an error rather than a guess.
+pub fn state_dir() -> Result<std::path::PathBuf, String> {
+    let absolute = |name: &str| {
+        std::env::var_os(name)
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let base = if cfg!(windows) {
+        absolute("LOCALAPPDATA").ok_or("LOCALAPPDATA is not an absolute path")?
+    } else {
+        absolute("XDG_STATE_HOME")
+            .or_else(|| absolute("HOME").map(|h| h.join(".local/state")))
+            .ok_or("no absolute state directory (set XDG_STATE_HOME or HOME)")?
+    };
+    Ok(base.join("tinyagentaccess"))
+}
 pub use pixels::{Frame, Point};
 #[cfg(any(test, feature = "test-support"))]
 use serde_json::{json, Value};

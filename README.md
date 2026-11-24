@@ -7,7 +7,7 @@ An open-source, self-hostable, local-first Rust rebuild of the Amazon WorkSpaces
 
 **v0.1.2:** desktop capture/input, sequences, forwarding, dialect adapters, local replay and human Stop, plus a read-only `doctor` command. On macOS, run at most one capturing server per desktop session.
 
-**Security: no authentication. Binds to localhost by default. Do not expose this server to a network or the public internet. Wildcard binds are rejected; concrete non-loopback binds warn. Host/Origin checks are not authentication.** Security: see [SECURITY.md](SECURITY.md).
+**Security: every `/mcp` request needs `Authorization: Bearer <token>` (a 0600 token file; **breaking change**, see [Authentication](#authentication)). Binds to localhost by default. There is no TLS: do not expose this server to a network or the public internet; reach a remote machine through an SSH tunnel. Wildcard binds are rejected; a concrete non-loopback bind needs `--allow-non-loopback` and still warns. Host/Origin checks are not authentication, and the token does not protect against other processes running as your user.** Security: see [SECURITY.md](SECURITY.md).
 
 **Not affiliated:** tinyAgentAccess is an independent project, not affiliated with,
 endorsed by, or associated with Amazon Web Services or Amazon. "Amazon", "AWS",
@@ -27,7 +27,7 @@ and the MIT-0 sample; this is not an official AWS product.
 | Forwarding | Local stdio MCP tools |
 | Dialects | Best-effort, **PROVISIONAL**, unverified against AWS |
 | Local replay / observer | **TINY-PROPOSAL**; local artifacts and human Stop |
-| Authentication | Not implemented |
+| Authentication | Bearer token file on every `/mcp` request plus a separate observer secret (**TINY-PROPOSAL**, not AWS SigV4/IAM or MCP OAuth; no TLS). Client header setups are documented but not tested against live OpenCode, Claude Code, or Codex |
 
 ### Current limitations / known issues
 
@@ -68,6 +68,36 @@ cargo run -p tinyagentaccess -- serve
 cargo run -p tinyagentaccess -- print-config
 ```
 
+The first `serve` creates the agent token and prints its **path** (never the token) on stderr. A named `--config` file that is missing or unreadable is now a startup error.
+
+### Authentication
+
+**TINY-PROPOSAL** (see [design](docs/design.md#authentication)); this is not AWS SigV4 or IAM and not MCP OAuth.
+
+- Every `/mcp` request (POST, GET, DELETE, including `initialize`) must carry exactly one `Authorization: Bearer <token>` header (scheme is case-insensitive). A missing, wrong, or duplicated header returns **401** with no `WWW-Authenticate` and no `resource_metadata`, so clients are not pushed into OAuth discovery. The check runs before the request body is read. Host/Origin checks still apply and still return 403; they are not authentication.
+- The token is 32 random bytes as 64 lowercase hex characters, in a file only your user can read. Default path: `$XDG_STATE_HOME/tinyagentaccess/mcp-token` (absolute `XDG_STATE_HOME`), else `~/.local/state/tinyagentaccess/mcp-token`; on Windows `%LOCALAPPDATA%\tinyagentaccess\mcp-token`. The directory is created `0700` and the file `0600` (Unix) or owner-only ACL (Windows). One shared token serves every port and instance of the same user.
+- If the default file is missing, `serve` creates it. An explicit `--token-file` / `[auth] token_file` that does not exist is an error and is never created. A file that other users can read is refused.
+- There is no no-auth mode. The token is read by the server from the file and is never put in the server's environment or logs.
+- Rotate with `tinyagentaccess rotate-token [--token-file PATH]` (prints the path, never the token); restart the server and update clients. Stop does not rotate or revoke the token.
+- The observer (`user_control_mode` not `disabled`) uses a **separate** secret in `observe-token` beside the agent token. `serve` prints `http://127.0.0.1:<port>/observe#<secret>` once on stderr; `tinyagentaccess observe-url` prints it again. Open that fragment URL, not the bare `/observe` page (which has no live data). The agent token and the observer secret must be different files with different values: `serve` and `observe-url` refuse to start if they are the same path, linked files, or equal values, so do not name your agent token file `observe-token`. The page reads the secret from the URL fragment and sends it as `X-TAA-Observe-Token`; the agent token does not open the observer and the observer secret does not open `/mcp`. To rotate the observer secret, stop the server, delete `observe-token`, and start again.
+- Non-loopback binds are rejected unless you pass `--allow-non-loopback` (or set `[auth] allow_non_loopback = true`); wildcard binds are always rejected. Even then the server warns: there is no TLS. Supported remote access is an SSH local forward to a loopback listener:
+
+```sh
+ssh -L 8765:127.0.0.1:8765 user@desktop-host
+# then use http://127.0.0.1:8765/mcp locally, with the token
+```
+
+`tinyagentaccess doctor` reports the token path, whether it exists and whether its permissions are owner-only. It never creates, rotates, or prints a token.
+
+`TAA_TOKEN` is the documented variable for the **client** process only. The server never exports it and removes it from the environment of forwarded MCP servers, even if you started `serve` from a shell that had it exported. Residual risk: any process running as your user, including the agent's own shell and forwarded children, can still read the 0600 token *file* or inherit an exported `TAA_TOKEN` in its own environment. See [SECURITY.md](SECURITY.md).
+
+#### Upgrading from 0.1.2 (breaking)
+
+- Every client must now send the bearer header; existing unauthenticated OpenCode/curl configs get 401 until updated.
+- A missing `--config` path now fails instead of silently using defaults.
+- Non-loopback binds need `--allow-non-loopback`.
+- Observer pages need the secret URL printed by `serve` / `observe-url`.
+
 ### macOS first run
 
 macOS Screen Recording and Accessibility permissions belong to the host app (the terminal or app that launches the server), not to a Rust source file. A new binary path or a new binary may need a new grant. The release and source builds are not notarized, so macOS may show Gatekeeper / unidentified-developer warnings.
@@ -85,10 +115,11 @@ After granting access, quit and restart the host app and then the server. Captur
 
 ### OpenCode (loopback)
 
-Start the server first, then point OpenCode at its `/mcp` endpoint:
+Start the server first, then point OpenCode at its `/mcp` endpoint with the bearer token from the environment:
 
 ```sh
-tinyagentaccess serve   # listens on 127.0.0.1:8765
+tinyagentaccess serve   # listens on 127.0.0.1:8765; prints the token file path
+export TAA_TOKEN=$(cat ~/.local/state/tinyagentaccess/mcp-token)   # or the path serve printed
 ```
 
 Add this to your OpenCode config (for example `opencode.json`). The shape follows the official [OpenCode MCP server docs](https://opencode.ai/docs/mcp-servers/): `mcp.servers.<name>` with `"type": "remote"` and an absolute Streamable HTTP `url`. The name `taa` is only a label.
@@ -101,35 +132,81 @@ Add this to your OpenCode config (for example `opencode.json`). The shape follow
       "taa": {
         "type": "remote",
         "url": "http://127.0.0.1:8765/mcp",
-        "oauth": false
+        "oauth": false,
+        "headers": {
+          "Authorization": "Bearer {env:TAA_TOKEN}"
+        }
       }
     }
   }
 }
 ```
 
-- OpenCode's docs say remote servers use OAuth by default and document `"oauth": false` to disable it. tinyAgentAccess has no authentication, so `"oauth": false` is appropriate here.
-- **This server has no authentication. Keep it on loopback** and do not point OpenCode at a non-loopback address.
+- OpenCode's docs say remote servers use OAuth by default and document `"oauth": false` and `headers` for remote servers. tinyAgentAccess uses a static bearer token, not OAuth, so keep `"oauth": false` and send the token in `headers`. Put the token in the environment, not in a committed JSON file. Environment variables are inherited by the agent's shell (residual risk; see [SECURITY.md](SECURITY.md)).
+- **Keep the server on loopback;** use an SSH tunnel for remote clients. The OpenCode process must actually have `TAA_TOKEN` set in its own environment (including any sandbox it runs in).
 - Tested with OpenCode v2.1.2 in Code Mode against a scratch loopback port (18776; the default 8765 is documented above). OpenCode exposed the tools as `tools.taa.agentaccess___...`, using the configured server name `taa`. In the same test, direct-list mode (`codemode: false`) did not expose usable tools even though the server showed as connected, so Code Mode is the tested path.
-- OpenCode does not ship an official tinyAgentAccess template; this is a user-side config. Other OpenCode options (timeouts, headers, and so on) were not tested.
+- OpenCode does not ship an official tinyAgentAccess template; this is a user-side config. **The `headers` / `Authorization` setup above was not tested with OpenCode v2.1.2 Code Mode** (the test above predates authentication and ran without a header); other OpenCode options (timeouts and so on) were not tested either.
+
+### Claude Code and Codex
+
+Both are documented-only setups; **not tested** against live clients in this change.
+
+Claude Code documents [environment variable expansion in `.mcp.json`](https://code.claude.com/docs/en/mcp#environment-variable-expansion-in-mcp-json), so the primary setup keeps the token out of the file:
+
+```json
+{
+  "mcpServers": {
+    "taa": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${TAA_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Secondary form, `claude mcp add --header`:
+
+```sh
+claude mcp add --transport http taa http://127.0.0.1:8765/mcp \
+  --header "Authorization: Bearer $TAA_TOKEN"
+```
+
+Warning: with this form your shell expands `$TAA_TOKEN` first, so the literal token can be written into the generated config (for example a project `.mcp.json`) and then committed. Check where the entry was saved before committing and prefer user scope.
+
+Codex CLI ([config.md](https://github.com/openai/codex/blob/88abbf58cec9843a7cebe250d71146314ebbcf1a/docs/config.md)) documents `bearer_token_env_var`, an optional environment variable holding a bearer token, for Streamable HTTP servers in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.taa]
+url = "http://127.0.0.1:8765/mcp"
+bearer_token_env_var = "TAA_TOKEN"
+```
+
+Do not put the token itself in `config.toml`.
+
+For every client, the process (and any sandbox it runs in) that reads the config must actually have `TAA_TOKEN` (or the variable named in `bearer_token_env_var`) set; an unset variable means no valid header and a 401. Verify this per client. These client setups remain documented-only and were not tested against live clients.
+
 
 Stateful curl smoke test (requires Python 3 to extract the session header):
 
 ```sh
-curl -sS -D /tmp/taa-headers -H 'Content-Type: application/json' \
+TAA_TOKEN=$(cat ~/.local/state/tinyagentaccess/mcp-token)   # or the path serve printed
+curl -sS -D /tmp/taa-headers -H "Authorization: Bearer $TAA_TOKEN" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}' \
   http://127.0.0.1:8765/mcp
 TAA_SESSION=$(python3 -c 'print(next(x.split(":",1)[1].strip() for x in open("/tmp/taa-headers") if x.lower().startswith("mcp-session-id:")))')
-curl -sS -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25' \
+curl -sS -H "Authorization: Bearer $TAA_TOKEN" -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25' \
   -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' http://127.0.0.1:8765/mcp
-curl -sS -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25' \
+curl -sS -H "Authorization: Bearer $TAA_TOKEN" -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25' \
   -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' http://127.0.0.1:8765/mcp
-curl -sS -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25' \
+curl -sS -H "Authorization: Bearer $TAA_TOKEN" -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25' \
   -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agentaccess___wait","arguments":{"duration":0.001}}}' http://127.0.0.1:8765/mcp
-curl -sS -i -X DELETE -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25' http://127.0.0.1:8765/mcp
+curl -sS -i -X DELETE -H "Authorization: Bearer $TAA_TOKEN" -H "Mcp-Session-Id: $TAA_SESSION" -H 'MCP-Protocol-Version: 2025-11-25' http://127.0.0.1:8765/mcp
 ```
 
-Run SDK interop against the running server by installing `mcp==2.1.1` in a virtual environment and running `python scripts/interop_python_sdk.py --url http://127.0.0.1:8765/mcp`. It tests both legacy/stateful and 2026-07-28/stateless modes.
+Run SDK interop against the running server by installing `mcp==2.1.1` in a virtual environment and running `TAA_TOKEN=$(cat ~/.local/state/tinyagentaccess/mcp-token) python scripts/interop_python_sdk.py --url http://127.0.0.1:8765/mcp` (or pass `--token-file PATH`). The scripts send the token as an `Authorization: Bearer` header on an httpx client given to the SDK transport. It tests both legacy/stateful and 2026-07-28/stateless modes.
 
 Desktop requirements:
 
@@ -152,7 +229,7 @@ See [Contributing](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md),
 
 [MIT](LICENSE) © 2026 Chen Nie.
 
-Wildcard binds (`0.0.0.0` / `::`) are rejected because this server has no authentication. Use the loopback default or an explicit concrete IP; non-loopback binds emit a no-auth warning and only that IP or loopback Host values are accepted.
+Wildcard binds (`0.0.0.0` / `::`) are always rejected. A concrete non-loopback IP is rejected unless you pass `--allow-non-loopback` (or `[auth] allow_non_loopback = true`), and it still warns that there is no TLS; only that IP or loopback Host values are accepted. The bearer token is required either way. Prefer an SSH tunnel to a loopback listener.
 
 Local screenshot saving is optional and disabled by default:
 
@@ -173,7 +250,7 @@ must be UTF-8 without a BOM:
 {"mcpServers":{"example":{"command":"/absolute/path/mcp-server","args":["--stdio"]}}}
 ```
 
-Only stdio is supported. Children inherit the server environment; `env`, `cwd` and
+Only stdio is supported. Children inherit the server environment except `TAA_TOKEN`, which is removed (children can still read the 0600 token file); `env`, `cwd` and
 other unknown keys are ignored with warnings. Tools appear as
 `forwarded___example___<tool>`. Lists and calls have a five-second timeout. Each MCP
 session owns its children and closes them on session expiry or closure. Forwarding-only
@@ -218,7 +295,7 @@ and remove it yourself. Unix creation modes are 0700/0600, Windows inherits ACLs
 symlink sink directories and existing output files are refused. Failures warn without
 changing the tool result. The optional replay byte budget stops frame storage with one warning; metadata and the index continue and may exceed the budget. Opaque metadata is capped (see [M7 choices](docs/design.md#m7-local-replay-and-human-control)).
 
-Open `http://127.0.0.1:8765/observe` on the same origin as the server. `view_only`
+Open the fragment URL printed by `serve` or `tinyagentaccess observe-url` (`http://127.0.0.1:8765/observe#<secret>`); the bare `/observe` page has no live data. The observer only accepts loopback Host headers, so with a non-loopback bind use an SSH forward (`ssh -L 8765:<bind-ip>:8765 user@host`) and open the printed `127.0.0.1` URL locally; the supported setup is a loopback listener plus the tunnel. `view_only`
 shows session selection and fresh screenshots; `view_stop` also shows Stop. `disabled`
 returns 404 for observer routes. All local sessions share one desktop; selection
 chooses which session to observe or close, not a separate OS desktop. Polling uses
@@ -236,6 +313,4 @@ or the tinyAgentAccess server. `user_control_mode` controls observation and Stop
 availability, not agent access.
 No `client_disconnected` notification is emitted: its AWS wire form is unknown.
 
-The observer is an **unauthenticated local substitute, not AWS DCV**. Keep the bind
-on loopback until authentication exists. Host/Origin checks and same-origin Stop
-requests reduce browser abuse; they do not authenticate local users.
+The observer is a **local substitute, not AWS DCV**. It is protected by a separate observer secret (see [Authentication](#authentication)) delivered in the URL fragment, in addition to the Host/Origin/Fetch-Metadata checks and same-origin Stop requests. Those browser checks reduce browser abuse; they are not identity. Keep the bind on loopback. The secret does not protect against other processes running as your user.

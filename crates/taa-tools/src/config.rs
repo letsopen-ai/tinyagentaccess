@@ -9,6 +9,15 @@ pub struct Config {
     pub replay: Replay,
     pub platform: PlatformConfig,
     pub forwarding: Forwarding,
+    pub auth: AuthConfig,
+}
+/// TINY-PROPOSAL: bearer-token file location and the non-loopback opt-in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Empty means the default state-directory path. A named path is never created.
+    pub token_file: String,
+    pub allow_non_loopback: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -48,6 +57,7 @@ impl Default for Config {
             replay: Replay::default(),
             platform: PlatformConfig::default(),
             forwarding: Forwarding::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -83,9 +93,15 @@ impl Config {
             .parse()
             .map_err(|_| "bind must be a concrete IP socket address")?;
         if bind.ip().is_unspecified() {
-            return Err(
-                "NO AUTHENTICATION: wildcard binds are unsafe; choose a concrete IP address".into(),
-            );
+            return Err("wildcard binds are rejected; choose a concrete IP address".into());
+        }
+        if !bind.ip().is_loopback() && !self.auth.allow_non_loopback {
+            return Err("non-loopback bind requires --allow-non-loopback or [auth] allow_non_loopback = true; there is no TLS, so reach a remote machine through an SSH tunnel to a loopback listener".into());
+        }
+        if !self.auth.token_file.is_empty()
+            && !std::path::Path::new(&self.auth.token_file).is_absolute()
+        {
+            return Err("auth.token_file must be absolute".into());
         }
         if !self.agent_access.computer_vision
             && !self.agent_access.computer_input

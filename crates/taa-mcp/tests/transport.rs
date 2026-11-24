@@ -7,12 +7,21 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use taa_mcp::{router, Server, MODERN, STATEFUL};
 use taa_platform::MockPlatform;
-use taa_tools::config::Config;
+use taa_tools::{auth::Auth, config::Config};
 use tower::ServiceExt;
+const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OBSERVER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+fn auth() -> Auth {
+    Auth::new(TOKEN, Some(OBSERVER.into()))
+}
+fn bearer() -> String {
+    format!("Bearer {TOKEN}")
+}
 fn app() -> Router {
     router(Server::new(
         Config::default(),
         Arc::new(MockPlatform::default()),
+        auth(),
     ))
 }
 async fn request(
@@ -37,6 +46,7 @@ async fn request(
         .method(method)
         .uri("/mcp")
         .header("host", "localhost:8765")
+        .header("authorization", bearer())
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream");
     if headers
@@ -283,7 +293,7 @@ async fn rpc_errors() {
 async fn idle_expiry() {
     let mut c = Config::default();
     c.sessions.idle_timeout_secs = 1;
-    let a = router(Server::new(c, Arc::new(MockPlatform::default())));
+    let a = router(Server::new(c, Arc::new(MockPlatform::default()), auth()));
     let (_, h, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
     tokio::time::sleep(std::time::Duration::from_millis(1010)).await;
     assert_eq!(
@@ -355,6 +365,7 @@ async fn protocol_validation() {
         .method("POST")
         .uri("/mcp")
         .header("host", "localhost")
+        .header("authorization", bearer())
         .header("content-type", "application/json")
         .header("accept", "application/json")
         .body(Body::from("{"))
@@ -372,7 +383,7 @@ async fn gated_calls_are_unknown() {
     let mut c = Config::default();
     c.agent_access.computer_input = false;
     c.agent_access.computer_vision = false;
-    let a = router(Server::new(c, Arc::new(MockPlatform::recording())));
+    let a = router(Server::new(c, Arc::new(MockPlatform::recording()), auth()));
     let (_, h, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
     for n in ["screenshot", "key", "execute_sequence", "close_session"] {
         let r = value(
@@ -426,7 +437,10 @@ async fn rpc_errors_preserve_desktop_id() {
 
 // Raw requests deliberately bypass the happy-path helper's metadata/header injection.
 async fn raw(a: &Router, body: impl Into<Body>, headers: &[(&str, &str)]) -> (StatusCode, Value) {
-    let mut b = Request::builder().method("POST").uri("/mcp");
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("authorization", bearer());
     for (k, v) in headers {
         b = b.header(*k, *v);
     }
@@ -586,6 +600,7 @@ async fn media_and_untrusted_headers() {
         .method("POST")
         .uri("/mcp")
         .header("host", "localhost")
+        .header("authorization", bearer())
         .header("content-type", "application/json")
         .header("accept", "*/*")
         .header(
@@ -599,12 +614,14 @@ async fn media_and_untrusted_headers() {
 
 #[tokio::test]
 async fn concrete_bind_security() {
-    let c = Config {
+    let mut c = Config {
         bind: "192.0.2.10:8765".into(),
         ..Config::default()
     };
+    assert!(c.validate().unwrap_err().contains("--allow-non-loopback"));
+    c.auth.allow_non_loopback = true;
     c.validate().unwrap();
-    let a = router(Server::new(c, Arc::new(MockPlatform::default())));
+    let a = router(Server::new(c, Arc::new(MockPlatform::default()), auth()));
     let h = [
         ("host", "192.0.2.10:8765"),
         ("content-type", "application/json"),
@@ -618,11 +635,12 @@ async fn concrete_bind_security() {
     ];
     assert_eq!(raw(&a, init(STATEFUL[2]).to_string(), &h).await.0, 403);
     for bind in ["0.0.0.0:8765", "[::]:8765"] {
-        let c = Config {
+        let mut c = Config {
             bind: bind.into(),
             ..Config::default()
         };
-        assert!(c.validate().unwrap_err().contains("NO AUTHENTICATION"));
+        c.auth.allow_non_loopback = true;
+        assert!(c.validate().unwrap_err().contains("wildcard"));
     }
 }
 
@@ -757,7 +775,7 @@ async fn modern_sequence_results_and_close_release() {
         } else {
             MockPlatform::default()
         });
-        let a = router(Server::new(Config::default(), p.clone()));
+        let a = router(Server::new(Config::default(), p.clone(), auth()));
         let h = [("mcp-protocol-version", MODERN)];
         let r = value(
             &request(
@@ -856,7 +874,7 @@ async fn transport_saves_standalone_and_terminal_images() {
     let tmp = tempfile::tempdir().unwrap();
     let mut c = Config::default();
     c.screenshots.save_dir = tmp.path().canonicalize().unwrap().to_str().unwrap().into();
-    let a = router(Server::new(c, Arc::new(MockPlatform::recording())));
+    let a = router(Server::new(c, Arc::new(MockPlatform::recording()), auth()));
     let h = [("mcp-protocol-version", MODERN)];
     let r = value(
         &request(
@@ -913,7 +931,7 @@ async fn forwarding_transport_modes() {
         config.agent_access.forward_mcp_tools = true;
         config.forwarding.config_path = path.to_str().unwrap().into();
         config.validate().unwrap();
-        let server = Server::new(config, Arc::new(MockPlatform::default()));
+        let server = Server::new(config, Arc::new(MockPlatform::default()), auth());
         let a = router(server.clone());
         let sid = if modern {
             String::new()
@@ -1017,7 +1035,7 @@ fn forwarding_app(mode: &str) -> (tempfile::TempDir, Arc<Server>, Router) {
     config.agent_access.forward_mcp_tools = true;
     config.sessions.idle_timeout_secs = 1;
     config.forwarding.config_path = path.to_str().unwrap().into();
-    let server = Server::new(config, Arc::new(MockPlatform::default()));
+    let server = Server::new(config, Arc::new(MockPlatform::default()), auth());
     let app = router(server.clone());
     (dir, server, app)
 }
@@ -1254,7 +1272,7 @@ async fn native_http_click_validates_after_geometry_refresh() {
             mock: MockPlatform::recording(),
             refreshes: std::sync::atomic::AtomicUsize::new(0),
         });
-        let app = router(Server::new(config, platform.clone()));
+        let app = router(Server::new(config, platform.clone(), auth()));
         let (status, headers, _) = request(&app, "POST", init(STATEFUL[2]), &[]).await;
         assert_eq!(status, StatusCode::OK);
         let sid = headers["mcp-session-id"].to_str().unwrap();
@@ -1301,7 +1319,7 @@ async fn dialect_headers_are_per_request_in_both_protocols() {
     const H: &str = "x-amzn-agentaccess-computer-use-interface-id";
     for modern in [false, true] {
         let platform = Arc::new(MockPlatform::recording());
-        let server = Server::new(Config::default(), platform.clone());
+        let server = Server::new(Config::default(), platform.clone(), auth());
         let a = router(server.clone());
         let sid = if modern {
             String::new()
@@ -1411,7 +1429,7 @@ async fn dialect_native_validation_cleanup_and_saving() {
     let mut config = Config::default();
     config.screenshots.save_dir = dir.path().to_string_lossy().into_owned();
     let platform = Arc::new(MockPlatform::recording());
-    let server = Server::new(config, platform.clone());
+    let server = Server::new(config, platform.clone(), auth());
     let a = router(server.clone());
     let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
     let sid = h["mcp-session-id"].to_str().unwrap();
@@ -1464,7 +1482,7 @@ async fn dialect_permissions() {
     let mut config = Config::default();
     config.agent_access.computer_input = false;
     let platform = Arc::new(MockPlatform::recording());
-    let server = Server::new(config, platform.clone());
+    let server = Server::new(config, platform.clone(), auth());
     let a = router(server.clone());
     let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
     let sid = h["mcp-session-id"].to_str().unwrap();
@@ -1489,7 +1507,7 @@ async fn dialect_permissions() {
 #[tokio::test]
 async fn dialect_action_errors_are_client_errors() {
     let platform = Arc::new(MockPlatform::recording());
-    let server = Server::new(Config::default(), platform.clone());
+    let server = Server::new(Config::default(), platform.clone(), auth());
     let a = router(server.clone());
     let (_, h, _) = request(&a, "POST", init(STATEFUL[1]), &[]).await;
     let sid = h["mcp-session-id"].to_str().unwrap();
@@ -1534,7 +1552,8 @@ async fn observer_request(
     let mut request = Request::builder()
         .method(method)
         .uri(path)
-        .header("host", "localhost:8765");
+        .header("host", "localhost:8765")
+        .header("x-taa-observe-token", OBSERVER);
     if let Some(origin) = origin {
         request = request.header("origin", origin);
     }
@@ -1570,7 +1589,7 @@ fn replay_files(path: &std::path::Path) -> Vec<std::path::PathBuf> {
 async fn observer_browser_navigation_is_page_only() {
     let mut c = Config::default();
     c.agent_access.user_control_mode = "view_stop".into();
-    let a = router(Server::new(c, Arc::new(MockPlatform::recording())));
+    let a = router(Server::new(c, Arc::new(MockPlatform::recording()), auth()));
     let (_, headers, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
     let sid = headers["mcp-session-id"].to_str().unwrap();
     let latest = format!("/observe/latest/{sid}");
@@ -1670,6 +1689,7 @@ async fn observer_browser_navigation_is_page_only() {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
+            .header("x-taa-observe-token", OBSERVER)
             .header("host", host)
             .header("sec-fetch-site", site)
             .header("sec-fetch-mode", mode)
@@ -1697,7 +1717,7 @@ async fn observer_modes_stop_and_transport_unchanged() {
         c.agent_access.user_control_mode = mode.into();
         c.agent_access.screen_resolution = "native".into();
         let platform = Arc::new(MockPlatform::recording());
-        let a = router(Server::new(c, platform.clone()));
+        let a = router(Server::new(c, platform.clone(), auth()));
         let (_, headers, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
         let sid = headers["mcp-session-id"].to_str().unwrap();
         let hdr = [("mcp-session-id", sid)];
@@ -1793,7 +1813,7 @@ async fn replay_http_close_delete_stop_and_disabled() {
         c.replay.enabled = end != "disabled";
         c.replay.save_dir = tmp.path().to_str().unwrap().into();
         c.sessions.idle_timeout_secs = 60;
-        let a = router(Server::new(c, Arc::new(MockPlatform::recording())));
+        let a = router(Server::new(c, Arc::new(MockPlatform::recording()), auth()));
         let modern = [("mcp-protocol-version", MODERN)];
         let sid = if end == "close" {
             let (_, _, body) = request(
@@ -1885,7 +1905,7 @@ async fn replay_translated_and_forwarded_metadata_and_stop_release() {
     c.replay.enabled = true;
     c.replay.save_dir = tmp.path().join("replay").to_str().unwrap().into();
     let platform = Arc::new(MockPlatform::recording());
-    let server = Server::new(c, platform.clone());
+    let server = Server::new(c, platform.clone(), auth());
     let a = router(server.clone());
     let (_, h, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
     let sid = h["mcp-session-id"].to_str().unwrap();
@@ -1926,4 +1946,199 @@ async fn replay_translated_and_forwarded_metadata_and_stop_release() {
     assert_eq!(rows[5]["response"]["truncated"], true);
     assert!(all.iter().any(|p| p.ends_with("index.html")));
     server.shutdown().await;
+}
+
+async fn bare(
+    app: &Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Body,
+) -> (StatusCode, axum::http::HeaderMap) {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "localhost:8765");
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let r = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
+    (r.status(), r.headers().clone())
+}
+/// A body that records its first poll and then never yields data.
+struct TrippedBody(Arc<std::sync::atomic::AtomicBool>);
+impl http_body::Body for TrippedBody {
+    type Data = axum::body::Bytes;
+    type Error = std::convert::Infallible;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Pending
+    }
+}
+#[tokio::test]
+async fn mcp_requires_exactly_one_valid_bearer_token() {
+    let a = app();
+    let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string();
+    let json_ct = ("content-type", "application/json");
+    let wrong = format!("Bearer {}", "c".repeat(64));
+    let observer_only = format!("Bearer {OBSERVER}");
+    let good = bearer();
+    let lower = good.replacen("Bearer", "bearer", 1);
+    for (method, headers) in [
+        ("POST", vec![json_ct]),
+        ("POST", vec![json_ct, ("authorization", wrong.as_str())]),
+        ("POST", vec![json_ct, ("authorization", "Bearer")]),
+        ("POST", vec![json_ct, ("authorization", TOKEN)]),
+        ("POST", vec![json_ct, ("authorization", "Basic YTpi")]),
+        (
+            "POST",
+            vec![json_ct, ("authorization", observer_only.as_str())],
+        ),
+        ("POST", vec![json_ct, ("x-taa-observe-token", OBSERVER)]),
+        (
+            "POST",
+            vec![
+                json_ct,
+                ("authorization", good.as_str()),
+                ("authorization", good.as_str()),
+            ],
+        ),
+        ("GET", vec![]),
+        ("DELETE", vec![("mcp-session-id", "x")]),
+    ] {
+        let (status, h) = bare(&a, method, "/mcp", &headers, Body::from(list.clone())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {headers:?}");
+        assert!(h.get("www-authenticate").is_none());
+        assert!(!format!("{h:?}").contains("resource_metadata"));
+    }
+    // Rejected before the body is read: the body records its first poll and
+    // then never completes, so only a handler that never touches it can answer.
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let unread = Body::new(TrippedBody(polled.clone()));
+    let (status, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        bare(&a, "POST", "/mcp", &[json_ct], unread),
+    )
+    .await
+    .expect("an unauthenticated request must be answered without waiting for its body");
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        !polled.load(std::sync::atomic::Ordering::SeqCst),
+        "the body was polled before authentication"
+    );
+    // The token alone is not enough: Host/Origin still apply and report 403.
+    let origin = [
+        json_ct,
+        ("authorization", good.as_str()),
+        ("origin", "https://evil.example"),
+    ];
+    assert_eq!(
+        bare(&a, "POST", "/mcp", &origin, Body::from(list.clone()))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    // A valid token (scheme case-insensitive) gets an exact 200 for a
+    // well-formed modern-protocol tools/list request.
+    let modern_list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":MODERN,"io.modelcontextprotocol/clientCapabilities":{}}}}).to_string();
+    for auth in [good.as_str(), lower.as_str()] {
+        let (status, _) = bare(
+            &a,
+            "POST",
+            "/mcp",
+            &[
+                json_ct,
+                ("authorization", auth),
+                ("accept", "application/json, text/event-stream"),
+                ("mcp-protocol-version", MODERN),
+                ("mcp-method", "tools/list"),
+            ],
+            Body::from(modern_list.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{auth}");
+    }
+}
+#[tokio::test]
+async fn observer_api_requires_its_own_secret_but_the_page_does_not() {
+    let mut c = Config::default();
+    c.agent_access.user_control_mode = "view_stop".into();
+    let a = router(Server::new(c, Arc::new(MockPlatform::recording()), auth()));
+    let (_, headers, _) = request(&a, "POST", init(STATEFUL[2]), &[]).await;
+    let sid = headers["mcp-session-id"].to_str().unwrap().to_string();
+    let latest = format!("/observe/latest/{sid}");
+    let stop = format!("/observe/stop/{sid}");
+    let agent = bearer();
+    let wrong = "c".repeat(64);
+    let origin = ("origin", "http://localhost:8765");
+    let routes = [
+        ("GET", "/observe/sessions"),
+        ("GET", latest.as_str()),
+        ("POST", stop.as_str()),
+    ];
+    for (method, path) in routes {
+        for creds in [
+            vec![],
+            vec![("x-taa-observe-token", wrong.as_str())],
+            vec![("x-taa-observe-token", TOKEN)],
+            vec![("authorization", agent.as_str())],
+            vec![
+                ("authorization", agent.as_str()),
+                ("x-taa-observe-token", wrong.as_str()),
+            ],
+        ] {
+            let mut h = vec![origin];
+            h.extend(creds.clone());
+            let (status, _) = bare(&a, method, path, &h, Body::empty()).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} {creds:?}"
+            );
+        }
+        // Host/Origin failures stay 403 even with the right secret.
+        let h = [
+            ("origin", "https://evil.example"),
+            ("x-taa-observe-token", OBSERVER),
+        ];
+        assert_eq!(
+            bare(&a, method, path, &h, Body::empty()).await.0,
+            StatusCode::FORBIDDEN
+        );
+        // Duplicate secret headers are rejected.
+        let h = [
+            origin,
+            ("x-taa-observe-token", OBSERVER),
+            ("x-taa-observe-token", OBSERVER),
+        ];
+        assert_eq!(
+            bare(&a, method, path, &h, Body::empty()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    // The page is delivered without a secret (it arrives in the URL fragment).
+    let (status, h) = bare(&a, "GET", "/observe", &[], Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(h.get("www-authenticate").is_none());
+    assert_eq!(h["referrer-policy"], "no-referrer");
+    let (status, _) = bare(
+        &a,
+        "GET",
+        "/observe",
+        &[("origin", "https://evil.example")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The correct secret works and the observer secret never opens /mcp.
+    let h = [origin, ("x-taa-observe-token", OBSERVER)];
+    assert_eq!(
+        bare(&a, "GET", "/observe/sessions", &h, Body::empty())
+            .await
+            .0,
+        StatusCode::OK
+    );
 }
