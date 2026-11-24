@@ -4,21 +4,23 @@ All notable changes are recorded here in [Keep a Changelog](https://keepachangel
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-24
+
 ### Added
 
-- Bearer-token authentication (**TINY-PROPOSAL**, not AWS SigV4/IAM or MCP OAuth): every `/mcp` request needs `Authorization: Bearer <token>` from a 0600 / owner-only token file (default created on first `serve`). Missing, wrong, or duplicate headers return 401 without `WWW-Authenticate` or `resource_metadata`, before the body is read.
-- A separate observer secret (`observe-token`) for `/observe/sessions`, `/observe/latest/{id}` and Stop, delivered in the `/observe#<secret>` URL fragment and sent as `X-TAA-Observe-Token`; observer responses send `Referrer-Policy: no-referrer`.
-- `serve --token-file` / `--allow-non-loopback`, `[auth]` config (`token_file`, `allow_non_loopback`), `tinyagentaccess rotate-token`, and `tinyagentaccess observe-url`.
-- `doctor` reports the auth token path, existence, and permission status (text and an additive JSON `auth` object); it never prints or creates a token.
+- Bearer-token authentication (**TINY-PROPOSAL**, not AWS SigV4/IAM or MCP OAuth): every `/mcp` request needs `Authorization: Bearer <token>` from a 0600 / owner-only token file (default created on first `serve`). Missing, wrong, or duplicate headers return 401 without `WWW-Authenticate` or `resource_metadata`, before the body is read ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)).
+- A separate observer secret (`observe-token`) for `/observe/sessions`, `/observe/latest/{id}` and Stop, delivered in the `/observe#<secret>` URL fragment and sent as `X-TAA-Observe-Token`; observer responses send `Referrer-Policy: no-referrer` ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)).
+- `serve --token-file` / `--allow-non-loopback`, `[auth]` config (`token_file`, `allow_non_loopback`), `tinyagentaccess rotate-token`, and `tinyagentaccess observe-url` ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)).
+- `doctor` reports the auth token path, existence, and permission status (text and an additive JSON `auth` object); it never prints or creates a token ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)).
 
 ### Changed
 
-- **BREAKING:** clients must send the bearer token. Existing unauthenticated OpenCode, curl, and other configs get 401 until updated (README has OpenCode, Claude Code, and Codex snippets; header setups were not tested against live clients).
-- **BREAKING:** a named `--config` path that is missing or unreadable now fails startup instead of silently using defaults.
-- **BREAKING:** a concrete non-loopback bind is rejected unless `--allow-non-loopback` (or `[auth] allow_non_loopback = true`) is set; it still warns that there is no TLS. Wildcard binds remain rejected.
-- Startup now prints the token file path, never the token.
-- `serve` and `observe-url` reject an agent token and observer secret that share a path, a link, or a value. First-time token creation publishes a complete file atomically. `TAA_TOKEN` is removed from forwarded MCP server environments. On Windows a token file must be owned by the current user. For non-loopback binds the observer URL printed is the loopback one, with an SSH-forward note. Interop scripts send the bearer token (`TAA_TOKEN` or `--token-file`).
-- Documentation: README, SECURITY.md, AGENTS.md, `docs/design.md`, and `config.example.toml` describe authentication. `docs/aws-parity.md` §12 now describes the local token-file departure and retains the AWS SigV4, IAM, and OAuth 2.1 via AWS Sign-In evidence.
+- **BREAKING:** authentication now fails closed. Clients must send the bearer token. Existing unauthenticated OpenCode, curl, and other configs get 401 until updated (README has OpenCode, Claude Code, and Codex snippets; header setups were not tested against live clients) ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)).
+- **BREAKING:** a named `--config` path that is missing or unreadable now fails startup instead of silently using defaults ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)).
+- **BREAKING:** a concrete non-loopback bind is rejected unless `--allow-non-loopback` (or `[auth] allow_non_loopback = true`) is set; it still warns that there is no TLS. Wildcard binds remain rejected ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)).
+- Startup now prints the token file path, never the token ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)).
+- `serve` and `observe-url` reject an agent token and observer secret that share a path, a link, or a value. First-time token creation publishes a complete file atomically. `TAA_TOKEN` is removed from forwarded MCP server environments. On Windows a token file must be owned by the current user. For non-loopback binds the observer URL printed is the loopback one, with an SSH-forward note. Interop scripts send the bearer token (`TAA_TOKEN` or `--token-file`) ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)).
+- Documentation: README, SECURITY.md, AGENTS.md, `docs/design.md`, and `config.example.toml` describe authentication ([#19](https://github.com/letsopen-ai/tinyagentaccess/pull/19)). `docs/aws-parity.md` §12 now describes the local token-file departure and retains the AWS SigV4, IAM, and OAuth 2.1 via AWS Sign-In evidence ([#20](https://github.com/letsopen-ai/tinyagentaccess/pull/20)).
 
 ## [0.1.2] - 2026-11-24
 
@@ -66,8 +68,9 @@ All notable changes are recorded here in [Keep a Changelog](https://keepachangel
 
 - Prepared community documentation, crate metadata, dependency license checks, and CI/release packaging.
 
-[Unreleased]: https://github.com/letsopen-ai/tinyagentaccess/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/letsopen-ai/tinyagentaccess/compare/v0.1.3...HEAD
 
+[0.1.3]: https://github.com/letsopen-ai/tinyagentaccess/releases/tag/v0.1.3
 [0.1.2]: https://github.com/letsopen-ai/tinyagentaccess/releases/tag/v0.1.2
 [0.1.1]: https://github.com/letsopen-ai/tinyagentaccess/releases/tag/v0.1.1
 [0.1.0]: https://github.com/letsopen-ai/tinyagentaccess/releases/tag/v0.1.0

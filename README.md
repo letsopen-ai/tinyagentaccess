@@ -5,7 +5,7 @@
 
 An open-source, self-hostable, local-first Rust rebuild of the Amazon WorkSpaces for AI agents MCP server. AWS-compatible native tool names, running on your own computer, with no AWS dependency.
 
-**v0.1.2:** desktop capture/input, sequences, forwarding, dialect adapters, local replay and human Stop, plus a read-only `doctor` command. On macOS, run at most one capturing server per desktop session.
+**v0.1.3:** Bearer-token authentication is now required for every `/mcp` request. Features include desktop capture/input, sequences, forwarding, dialect adapters, local replay and human Stop, plus a read-only `doctor` command. On macOS, run at most one capturing server per desktop session.
 
 **Security: every `/mcp` request needs `Authorization: Bearer <token>` (a 0600 token file; **breaking change**, see [Authentication](#authentication)). Binds to localhost by default. There is no TLS: do not expose this server to a network or the public internet; reach a remote machine through an SSH tunnel. Wildcard binds are rejected; a concrete non-loopback bind needs `--allow-non-loopback` and still warns. Host/Origin checks are not authentication, and the token does not protect against other processes running as your user.** Security: see [SECURITY.md](SECURITY.md).
 
@@ -47,7 +47,7 @@ have `.sigstore.json` signatures. For example:
 
 ```sh
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity "https://github.com/letsopen-ai/tinyagentaccess/.github/workflows/release.yml@refs/tags/v0.1.2" \
+  --certificate-identity "https://github.com/letsopen-ai/tinyagentaccess/.github/workflows/release.yml@refs/tags/v0.1.3" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 ```
