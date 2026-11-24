@@ -9,6 +9,10 @@ All notable changes are recorded here in [Keep a Changelog](https://keepachangel
 - Read-only `tinyagentaccess doctor [--json]` command that reports the version, binary path and SHA-256, parent process chain and likely host app, SSH / non-GUI hints, a remedy, and on macOS the no-prompt Screen Recording and Accessibility preflight results and ScreenCaptureKit availability. Exit codes: 0 pass or not applicable, 1 macOS preflight failed, 2 usage or doctor error.
 - Documentation: macOS first-run guidance (host-app permissions, non-notarized build, restart after granting), an OpenCode loopback config for `http://127.0.0.1:8765/mcp`, and a README known-issue note about an unconfirmed 10 s ScreenCaptureKit timeout with two capturing servers.
 
+### Fixed
+
+- `doctor` now recognizes both `Grok Bot` and `Grok Bot Helper` as macOS permission hosts instead of reporting an unknown host. If the nearest GUI match would be `Grok Bot Helper` and `Grok Bot` is also in the chain, the app (`Grok Bot`) is preferred; a helper-only chain still reports `Grok Bot Helper`. The same helper-to-app preference applies to other known hosts (for example `Code Helper` and `Code`). A nearer known terminal is still preferred over a GUI host.
+
 ## [0.1.1] - 2026-11-18
 
 ### Fixed

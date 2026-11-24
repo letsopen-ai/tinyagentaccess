@@ -133,6 +133,8 @@ const TERMINALS: &[&str] = &[
 const GUI_HOSTS: &[&str] = &[
     "code",
     "code helper",
+    "grok bot",
+    "grok bot helper",
     "cursor",
     "electron",
     "claude",
@@ -179,9 +181,23 @@ pub fn likely_host_app(chain: &[Proc]) -> Option<String> {
         })
         .collect();
     let pick = |set: &[&str]| rest.iter().find(|p| set.contains(&base(&p.name).as_str()));
-    pick(TERMINALS)
-        .or_else(|| pick(GUI_HOSTS))
-        .map(|p| p.name.clone())
+    if let Some(t) = pick(TERMINALS) {
+        return Some(t.name.clone());
+    }
+    let gui = pick(GUI_HOSTS)?;
+    // Permissions are granted to the app, not its helper subprocess: when the
+    // nearest match is "Foo Helper" and "Foo" is also a known host in the
+    // chain, report "Foo".
+    let gb = base(&gui.name);
+    if let Some(app) = gb.strip_suffix(" helper") {
+        if let Some(p) = rest
+            .iter()
+            .find(|p| base(&p.name) == app && GUI_HOSTS.contains(&app))
+        {
+            return Some(p.name.clone());
+        }
+    }
+    Some(gui.name.clone())
 }
 
 pub fn hints(f: &Facts) -> Vec<String> {
@@ -390,7 +406,28 @@ mod tests {
         );
         assert_eq!(
             likely_host_app(&chain(&["sh", "Code Helper", "Code"])).as_deref(),
+            Some("Code")
+        );
+        assert_eq!(
+            likely_host_app(&chain(&["sh", "Code Helper", "launchd"])).as_deref(),
             Some("Code Helper")
+        );
+        assert_eq!(
+            likely_host_app(&chain(&["zsh", "Grok Bot Helper", "Grok Bot", "launchd"])).as_deref(),
+            Some("Grok Bot")
+        );
+        assert_eq!(
+            likely_host_app(&chain(&["zsh", "Grok Bot", "launchd"])).as_deref(),
+            Some("Grok Bot")
+        );
+        assert_eq!(
+            likely_host_app(&chain(&["zsh", "Grok Bot Helper", "launchd"])).as_deref(),
+            Some("Grok Bot Helper")
+        );
+        assert_eq!(
+            likely_host_app(&chain(&["time", "zsh", "Grok Bot Helper", "Grok Bot", "?"]))
+                .as_deref(),
+            Some("Grok Bot")
         );
         assert_eq!(likely_host_app(&chain(&["bash", "mytool", "init"])), None);
         assert_eq!(likely_host_app(&chain(&["tinyagentaccess"])), None);
