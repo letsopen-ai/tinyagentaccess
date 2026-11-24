@@ -4,18 +4,20 @@ All notable changes are recorded here in [Keep a Changelog](https://keepachangel
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-24
+
 ### Added
 
-- Read-only `tinyagentaccess doctor [--json]` command that reports the version, binary path and SHA-256, parent process chain and likely host app, SSH / non-GUI hints, a remedy, and on macOS the no-prompt Screen Recording and Accessibility preflight results and ScreenCaptureKit availability. Exit codes: 0 pass or not applicable, 1 macOS preflight failed, 2 usage or doctor error.
-- Documentation: macOS first-run guidance (host-app permissions, non-notarized build, restart after granting), an OpenCode loopback config for `http://127.0.0.1:8765/mcp`, and a README known-issue note about the 10 s ScreenCaptureKit timeout when two servers capture (see Changed).
+- Read-only `tinyagentaccess doctor [--json]` command that reports the version, binary path and SHA-256, parent process chain and likely host app, SSH / non-GUI hints, a remedy, and on macOS the no-prompt Screen Recording and Accessibility preflight results and ScreenCaptureKit availability. Exit codes: 0 pass or not applicable, 1 macOS preflight failed, 2 usage or doctor error ([#14](https://github.com/letsopen-ai/tinyagentaccess/pull/14)).
+- Documentation: macOS first-run guidance (host-app permissions, non-notarized build, restart after granting), an OpenCode loopback config for `http://127.0.0.1:8765/mcp`, and a README known-issue note about the 10 s ScreenCaptureKit timeout when two servers capture (see Changed) ([#14](https://github.com/letsopen-ai/tinyagentaccess/pull/14)).
 
 ### Changed
 
-- Documentation: the two-capturing-servers ScreenCaptureKit timeout is now confirmed by a real-Mac isolation run (2026-11-24). Run at most one capturing server per desktop session. In that run, a second process that attempted capture after another had already captured timed out after 10 s and left both processes unable to capture until restarted. Documented as a deployment limitation, not a proven code bug; no code change.
+- Documentation: the two-capturing-servers ScreenCaptureKit timeout is now confirmed by a real-Mac isolation run (2026-11-24). Run at most one capturing server per desktop session. In that run, a second process that attempted capture after another had already captured timed out after 10 s and left both processes unable to capture until restarted. Documented as a deployment limitation, not a proven code bug; no code change ([#16](https://github.com/letsopen-ai/tinyagentaccess/pull/16)).
 
 ### Fixed
 
-- `doctor` now recognizes both `Grok Bot` and `Grok Bot Helper` as macOS permission hosts instead of reporting an unknown host. If the nearest GUI match would be `Grok Bot Helper` and `Grok Bot` is also in the chain, the app (`Grok Bot`) is preferred; a helper-only chain still reports `Grok Bot Helper`. The same helper-to-app preference applies to other known hosts (for example `Code Helper` and `Code`). A nearer known terminal is still preferred over a GUI host.
+- `doctor` now recognizes both `Grok Bot` and `Grok Bot Helper` as macOS permission hosts instead of reporting an unknown host. If the nearest GUI match would be `Grok Bot Helper` and `Grok Bot` is also in the chain, the app (`Grok Bot`) is preferred; a helper-only chain still reports `Grok Bot Helper`. The same helper-to-app preference applies to other known hosts (for example `Code Helper` and `Code`). A nearer known terminal is still preferred over a GUI host ([#15](https://github.com/letsopen-ai/tinyagentaccess/pull/15)).
 
 ## [0.1.1] - 2026-11-18
 
@@ -48,7 +50,8 @@ All notable changes are recorded here in [Keep a Changelog](https://keepachangel
 
 - Prepared community documentation, crate metadata, dependency license checks, and CI/release packaging.
 
-[Unreleased]: https://github.com/letsopen-ai/tinyagentaccess/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/letsopen-ai/tinyagentaccess/compare/v0.1.2...HEAD
 
+[0.1.2]: https://github.com/letsopen-ai/tinyagentaccess/releases/tag/v0.1.2
 [0.1.1]: https://github.com/letsopen-ai/tinyagentaccess/releases/tag/v0.1.1
 [0.1.0]: https://github.com/letsopen-ai/tinyagentaccess/releases/tag/v0.1.0

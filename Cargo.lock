@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "taa-forward"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "taa-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "serde_json",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "taa-platform"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ashpd",
  "block2",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "taa-tools"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "serde",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "tinyagentaccess"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "libc",
