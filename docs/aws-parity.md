@@ -1,6 +1,6 @@
 # AWS WorkSpaces "agent access" MCP server (agentaccess-mcp): functional spec for tinyAgentAccess
 
-Status: researched Nov 16, 2026. Revision 2: revises an earlier draft after checking it line by line against the AWS docs and extending it.
+Status: researched Nov 16, 2026. Revision 2: revises an earlier draft after checking it line by line against the AWS docs and extending it. Revision 3 (24 Nov 2026, maintainer-authorized): §12 documents the shipped local token-file departure alongside the existing AWS evidence.
 Scope: functional behavior to reproduce in tinyAgentAccess (Rust, letsopen-ai org). Section 12 covers AWS authentication and the local token-file departure.
 
 tinyAgentAccess is independent and is not affiliated with, endorsed by, or sponsored by Amazon Web Services or Amazon. Amazon WorkSpaces, AWS, and related marks are trademarks of Amazon.com, Inc. or its affiliates. This document independently summarizes and paraphrases AWS public documentation with citations; the [official AWS developer guide](https://docs.aws.amazon.com/appstream2/latest/developerguide/agent-access.html) is authoritative and remains Amazon’s copyright. See [§16](#16-sources) for sources; the AWS sample repository is MIT-0.
