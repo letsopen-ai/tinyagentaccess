@@ -21,6 +21,8 @@ Install `xdg-desktop-portal` and your compositor's backend (`xdg-desktop-portal-
 
 A persistent restore token is saved with mode 0600 at `$XDG_STATE_HOME/tinyagentaccess/portal-restore-token`, falling back to `~/.local/state/tinyagentaccess/portal-restore-token`. Restarting reuses it; compositor policy can still ask again. To reset consent, stop the server, delete that file, revoke sharing in your desktop's permission UI if desired, and restart. Closing sharing ends the input session; next input creates a new one. Screenshot is independently authorized and may prompt again. Accepted owned regular temporary PNGs are removed after reading; unsafe paths are refused and left untouched. Consent operations time out after 60 seconds and return SERVER_ERROR; session info remains available during pending consent. The application directory is 0700; missing/relative state roots disable persistence, and save failures warn without failing input authorization. Screenshot cannot reliably honor include_cursor=false or guarantee include_cursor=true.
 
+In the tested headless GNOME Wayland session already remoted by GNOME Remote Desktop, screenshots succeeded and input timed out after 60 seconds while waiting for `RemoteDesktop.Start` to complete. See [the headless GNOME Wayland test results](testing.md#known-limitation-headless-gnome-wayland-v012-ubuntu-2404).
+
 Auto mode prefers Wayland even when XWayland sets DISPLAY. Use `platform.linux_backend="x11"` only when intentionally controlling an actual X11 desktop; XTest in XWayland does not control native Wayland applications.
 
 ## X11
