@@ -1,11 +1,17 @@
 bind = "127.0.0.1:8765"
+[auth]
+# /mcp always requires "Authorization: Bearer <token>"; there is no no-auth mode.
+# token_file = "" # absolute path to an existing 0600 token file; empty = default state-dir path (created on first start)
+# Default: $XDG_STATE_HOME/tinyagentaccess/mcp-token, ~/.local/state/tinyagentaccess/mcp-token, or %LOCALAPPDATA%\tinyagentaccess\mcp-token.
+# The observer secret ("observe-token") lives beside it and is used only when user_control_mode is not "disabled".
+allow_non_loopback = false # a concrete non-loopback bind needs true (or --allow-non-loopback); still warns, no TLS. Prefer an SSH tunnel.
 [agent_access]
 computer_vision = true
 computer_input = true
 forward_mcp_tools = false # enable stdio tools from the redirection config (forwarding-only is allowed)
 screen_resolution = "1280x720" # or "native"
 screen_image_format = "png" # png | jpeg
-user_control_mode = "disabled" # view_only | view_stop | disabled; local /observe UI, unauthenticated
+user_control_mode = "disabled" # view_only | view_stop | disabled; local /observe UI; when enabled it needs the separate observer secret (see [auth])
 # TINY-PROPOSAL: Stop closes only the selected MCP session, releases input and ends forwarding.
 # It does not block new sessions; clients/agents may start a new one after the stopped session is rejected:
 # https://modelcontextprotocol.io/specification/2025-11-25/basic/transports

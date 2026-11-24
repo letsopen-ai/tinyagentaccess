@@ -19,5 +19,7 @@ List remaining gaps, platform validation limits, and PROVISIONAL / TINY-PROPOSAL
 - [ ] Relevant tests and docs updated for behavior changes
 - [ ] No secrets, personal paths, or sensitive screenshots/replays
 
-Reviewers: this server has **no authentication**. Preserve loopback defaults,
-wildcard-bind rejection, and the warning on non-loopback binds.
+Reviewers: `/mcp` requires a bearer token and the observer uses a separate secret.
+Preserve the loopback default and wildcard-bind rejection. A non-loopback bind
+needs the token plus `--allow-non-loopback` and still warns that there is no TLS.
+Host/Origin checks are not authentication. Do not add a no-auth mode.

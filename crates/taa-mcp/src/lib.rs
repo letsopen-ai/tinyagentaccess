@@ -1,8 +1,9 @@
 //! Streamable HTTP, without TLS or an MCP framework dependency.
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get as route_get, post},
     Json, Router,
@@ -17,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 use taa_platform::Platform;
-use taa_tools::{client, config::Config, result, text, PREFIX};
+use taa_tools::{auth::Auth, client, config::Config, result, text, PREFIX};
 pub const MODERN: &str = "2026-07-28";
 pub const STATEFUL: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
 pub use taa_tools::dialects::Interface;
@@ -37,15 +38,18 @@ struct Sessions {
 pub struct Server {
     pub config: Config,
     pub platform: Arc<dyn Platform>,
+    auth: Auth,
     sessions: Mutex<Sessions>,
     desktop: Arc<tokio::sync::Mutex<()>>,
     held: Arc<Mutex<Option<Held>>>,
 }
 impl Server {
-    pub fn new(config: Config, platform: Arc<dyn Platform>) -> Arc<Self> {
+    /// There is no unauthenticated mode: `auth` always gates `/mcp` and the observer.
+    pub fn new(config: Config, platform: Arc<dyn Platform>, auth: Auth) -> Arc<Self> {
         let server = Arc::new(Self {
             config,
             platform,
+            auth,
             sessions: Mutex::new(Sessions::default()),
             desktop: Arc::default(),
             held: Arc::default(),
@@ -302,14 +306,70 @@ impl Drop for ActiveSession {
 }
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub fn router(server: Arc<Server>) -> Router {
-    Router::new()
+    // The guard runs before any handler, so the body is never read for a
+    // request that fails the browser checks or the bearer check.
+    let mcp = Router::new()
         .route("/mcp", post(handle).get(get).delete(delete))
+        .layer(middleware::from_fn_with_state(server.clone(), mcp_guard));
+    let observer = Router::new()
         .route("/observe", route_get(observe))
         .route("/observe/sessions", route_get(observe_sessions))
         .route("/observe/latest/{session}", route_get(observe_latest))
         .route("/observe/stop/{session}", post(observe_stop))
+        .layer(middleware::from_fn(no_referrer));
+    mcp.merge(observer)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(server)
+}
+async fn no_referrer(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "referrer-policy",
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+/// The value of a header that must appear exactly once.
+fn single_header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = h.get_all(name).iter();
+    match (values.next(), values.next()) {
+        (Some(v), None) => v.to_str().ok(),
+        _ => None,
+    }
+}
+/// `Authorization: Bearer <token>`; the scheme is case-insensitive.
+fn bearer(h: &HeaderMap) -> Option<&str> {
+    let (scheme, token) = single_header(h, "authorization")?.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
+}
+// TINY-PROPOSAL (docs/design.md, Authentication): no WWW-Authenticate and no
+// resource_metadata, so MCP clients are not pushed into OAuth discovery.
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        "Unauthorized: a valid Authorization: Bearer token is required (see the README)",
+    )
+        .into_response()
+}
+fn observer_unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        "Unauthorized: the X-TAA-Observe-Token header is required; open the URL printed by `tinyagentaccess observe-url` (see the README)",
+    )
+        .into_response()
+}
+async fn mcp_guard(State(s): State<Arc<Server>>, request: Request, next: Next) -> Response {
+    if !security(request.headers(), &s.config) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !bearer(request.headers()).is_some_and(|t| s.auth.agent_matches(t)) {
+        return unauthorized();
+    }
+    next.run(request).await
+}
+/// The observer secret is a separate credential from the agent token.
+fn observer_secret_ok(s: &Server, h: &HeaderMap) -> bool {
+    single_header(h, "x-taa-observe-token").is_some_and(|t| s.auth.observer_matches(t))
 }
 fn header<'a>(h: &'a HeaderMap, k: &str) -> &'a str {
     h.get(k).and_then(|v| v.to_str().ok()).unwrap_or("")
@@ -358,16 +418,12 @@ fn security(h: &HeaderMap, c: &Config) -> bool {
     }
     true
 }
-async fn get(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
-    if !security(&h, &s.config) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
+// Host/Origin and bearer checks for /mcp happen once, in `mcp_guard`, which
+// wraps every production /mcp route.
+async fn get() -> Response {
     StatusCode::METHOD_NOT_ALLOWED.into_response()
 }
 async fn delete(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
-    if !security(&h, &s.config) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     if header(&h, "mcp-protocol-version") == MODERN {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
@@ -395,7 +451,9 @@ async fn delete(State(s): State<Arc<Server>>, h: HeaderMap) -> Response {
     s.close_released(id).await;
     StatusCode::NO_CONTENT.into_response()
 }
-// TINY-PROPOSAL (D-session): same-origin local polling, not DCV; no authentication.
+// TINY-PROPOSAL (D-session): same-origin local polling, not DCV. Data routes need the
+// separate observer secret; the page itself carries no data, so it cannot require one
+// (the secret arrives in the URL fragment, which browsers never send).
 fn observer_origin_allowed(s: &Server, h: &HeaderMap) -> bool {
     security(h, &s.config)
         && local_host(authority_host(header(h, "host")))
@@ -435,6 +493,9 @@ async fn observe_sessions(State(s): State<Arc<Server>>, h: HeaderMap) -> Respons
     if s.config.agent_access.user_control_mode == "disabled" {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if !observer_secret_ok(&s, &h) {
+        return observer_unauthorized();
+    }
     let mut sessions = s.sessions.lock().unwrap();
     s.cleanup(&mut sessions);
     let mut ids: Vec<_> = sessions.open.keys().cloned().collect();
@@ -455,6 +516,9 @@ async fn observe_latest(
     }
     if s.config.agent_access.user_control_mode == "disabled" {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if !observer_secret_ok(&s, &h) {
+        return observer_unauthorized();
     }
     if !s.config.agent_access.computer_vision {
         return (StatusCode::FORBIDDEN, "Computer vision disabled").into_response();
@@ -483,6 +547,9 @@ async fn observe_stop(
     }
     if s.config.agent_access.user_control_mode == "disabled" {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if !observer_secret_ok(&s, &h) {
+        return observer_unauthorized();
     }
     // Require an explicit matching Origin for a state-changing browser request.
     if s.config.agent_access.user_control_mode != "view_stop" || header(&h, "origin").is_empty() {
@@ -548,9 +615,6 @@ fn request_error(
     response
 }
 async fn handle(State(s): State<Arc<Server>>, h: HeaderMap, body: Bytes) -> Response {
-    if !security(&h, &s.config) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     for name in [
         "mcp-protocol-version",
         "mcp-session-id",
@@ -1110,10 +1174,17 @@ async fn handle_one(s: Arc<Server>, h: HeaderMap, v: Value) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_auth() -> Auth {
+        Auth::new("a".repeat(64), Some("b".repeat(64)))
+    }
     fn server() -> Arc<Server> {
         let mut c = Config::default();
         c.sessions.idle_timeout_secs = 1;
-        Server::new(c, Arc::new(taa_platform::MockPlatform::recording()))
+        Server::new(
+            c,
+            Arc::new(taa_platform::MockPlatform::recording()),
+            test_auth(),
+        )
     }
     fn call(
         s: Arc<Server>,
@@ -1133,12 +1204,13 @@ mod tests {
         let mut config = Config::default();
         config.sessions.max_sessions = 2;
         let mock = Arc::new(taa_platform::MockPlatform::recording());
-        (Server::new(config, mock.clone()), mock)
+        (Server::new(config, mock.clone(), test_auth()), mock)
     }
     fn observer_headers() -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("host", "localhost".parse().unwrap());
         h.insert("origin", "http://localhost".parse().unwrap());
+        h.insert("x-taa-observe-token", "b".repeat(64).parse().unwrap());
         h
     }
     #[tokio::test]
@@ -1149,7 +1221,11 @@ mod tests {
         config.agent_access.screen_resolution = "native".into();
         config.replay.enabled = true;
         config.replay.save_dir = tmp.path().to_str().unwrap().into();
-        let s = Server::new(config, Arc::new(taa_platform::MockPlatform::recording()));
+        let s = Server::new(
+            config,
+            Arc::new(taa_platform::MockPlatform::recording()),
+            test_auth(),
+        );
         let sid = s.open(STATEFUL[2]).unwrap();
         let response = call(s.clone(), &sid, "key", json!({"keys":"a"})).await;
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1200,7 +1276,11 @@ mod tests {
         let mut c = Config::default();
         c.sessions.idle_timeout_secs = 60;
         c.agent_access.user_control_mode = "view_only".into();
-        let s = Server::new(c, Arc::new(taa_platform::MockPlatform::recording()));
+        let s = Server::new(
+            c,
+            Arc::new(taa_platform::MockPlatform::recording()),
+            test_auth(),
+        );
         let sid = s.open(STATEFUL[2]).unwrap();
         let touched = s.sessions.lock().unwrap().open[&sid].touched;
         for _ in 0..3 {
@@ -1255,11 +1335,60 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn observer_routes_need_the_observer_secret_after_host_checks() {
+        let mut c = Config::default();
+        c.agent_access.user_control_mode = "view_stop".into();
+        let s = Server::new(
+            c,
+            Arc::new(taa_platform::MockPlatform::recording()),
+            test_auth(),
+        );
+        let sid = s.open(STATEFUL[2]).unwrap();
+        let mut none = observer_headers();
+        none.remove("x-taa-observe-token");
+        let mut wrong = observer_headers();
+        wrong.insert("x-taa-observe-token", "c".repeat(64).parse().unwrap());
+        let mut agent_only = observer_headers();
+        agent_only.insert("x-taa-observe-token", "a".repeat(64).parse().unwrap());
+        agent_only.insert(
+            "authorization",
+            format!("Bearer {}", "a".repeat(64)).parse().unwrap(),
+        );
+        for h in [none, wrong, agent_only] {
+            assert_eq!(
+                observe_sessions(State(s.clone()), h.clone()).await.status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                observe_latest(State(s.clone()), h.clone(), Path(sid.clone()))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                observe_stop(State(s.clone()), h.clone(), Path(sid.clone()))
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            // The HTML page itself is delivered without the secret.
+            let mut page = h;
+            page.remove("authorization");
+            assert_eq!(
+                observe(State(s.clone()), page).await.status(),
+                StatusCode::OK
+            );
+        }
+        assert!(!s.sessions.lock().unwrap().open[&sid]
+            .stopping
+            .load(Ordering::SeqCst));
+    }
+    #[tokio::test]
     async fn stop_interrupts_sequence_and_rejects_queued_call() {
         let mut c = Config::default();
         c.agent_access.user_control_mode = "view_stop".into();
         let p = Arc::new(taa_platform::MockPlatform::recording());
-        let s = Server::new(c, p.clone());
+        let s = Server::new(c, p.clone(), test_auth());
         let sid = s.open(STATEFUL[2]).unwrap();
         let sequence = tokio::spawn(call(
             s.clone(),
@@ -1267,21 +1396,29 @@ mod tests {
             "execute_sequence",
             json!({"actions":[{"type":"wait","duration":0.2},{"type":"key","keys":"a"},{"type":"key","keys":"b"}]}),
         ));
-        while s.sessions.lock().unwrap().open[&sid].active == 0 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while s.sessions.lock().unwrap().open[&sid].active == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sequence never became active");
         let queued = tokio::spawn(call(s.clone(), &sid, "key", json!({"keys":"c"})));
         let stop = tokio::spawn(observe_stop(
             State(s.clone()),
             observer_headers(),
             Path(sid.clone()),
         ));
-        while !s.sessions.lock().unwrap().open[&sid]
-            .stopping
-            .load(Ordering::SeqCst)
-        {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !s.sessions.lock().unwrap().open[&sid]
+                .stopping
+                .load(Ordering::SeqCst)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stop request never set the stopping flag");
         let response = sequence.await.unwrap();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1349,7 +1486,7 @@ mod tests {
     async fn partial_motion_cleanup(expire: bool) {
         use taa_platform::{Button, Key, Operation, Point};
         let platform = Arc::new(PartialPlatform::default());
-        let s = Server::new(Config::default(), platform.clone());
+        let s = Server::new(Config::default(), platform.clone(), test_auth());
         let id = s.open(STATEFUL[2]).unwrap();
         let p = SessionPlatform {
             inner: platform.clone(),
@@ -1537,7 +1674,7 @@ mod tests {
         let mut config = Config::default();
         config.agent_access.screen_resolution = "native".into();
         let mock = Arc::new(taa_platform::MockPlatform::recording());
-        let s = Server::new(config, mock.clone());
+        let s = Server::new(config, mock.clone(), test_auth());
         let id = s.open(MODERN).unwrap();
         let point = taa_platform::Point { x: 10, y: 20 };
         SessionPlatform {
@@ -1655,7 +1792,7 @@ mod tests {
         }
         let mut config = Config::default();
         config.agent_access.screen_resolution = "native".into();
-        let s = Server::new(config, Arc::new(Pending));
+        let s = Server::new(config, Arc::new(Pending), test_auth());
         let sid = s.open(STATEFUL[2]).unwrap();
         let _consent = s.desktop.lock().await;
         let response = tokio::time::timeout(

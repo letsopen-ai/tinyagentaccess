@@ -37,8 +37,13 @@ config_path = {json.dumps(str(redirect))}
 [platform]
 linux_backend = "x11"
 ''', encoding="utf-8")
-    environment = dict(os.environ, XDG_SESSION_TYPE="x11")
+    # The server never gets the token in its environment; it creates and reads
+    # its own token file under an isolated XDG_STATE_HOME. TAA_TOKEN is passed
+    # only to the interop client children.
+    environment = dict(os.environ, XDG_SESSION_TYPE="x11", XDG_STATE_HOME=str(directory / "state"))
     environment.pop("WAYLAND_DISPLAY", None)
+    environment.pop("TAA_TOKEN", None)
+    token_file = directory / "state" / "tinyagentaccess" / "mcp-token"
     url = f"http://127.0.0.1:{port}/mcp"
     with (directory / "stderr.log").open("w+") as log:
         process = subprocess.Popen([str(root / "target/debug/tinyagentaccess"), "serve", "--config", str(config)], env=environment, stderr=log)
@@ -49,15 +54,18 @@ linux_backend = "x11"
                 try:
                     urllib.request.urlopen(url, timeout=0.2)
                 except urllib.error.HTTPError as error:
-                    if error.code == 405:
+                    # An unauthenticated GET is 401 once the server is listening;
+                    # no success without a token is expected or accepted.
+                    if error.code == 401:
                         break
                 except OSError:
                     pass
                 time.sleep(0.05)
             else:
                 raise RuntimeError("server readiness timeout")
+            client_environment = dict(environment, TAA_TOKEN=token_file.read_text(encoding="ascii").strip())
             for script in ["interop_python_sdk.py", "interop_forwarding.py"]:
-                subprocess.run([os.environ["MCP_PYTHON"], str(root / "scripts" / script), "--url", url], check=True, env=environment)
+                subprocess.run([os.environ["MCP_PYTHON"], str(root / "scripts" / script), "--url", url], check=True, env=client_environment)
         except BaseException:
             log.flush()
             log.seek(0)

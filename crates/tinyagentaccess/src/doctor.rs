@@ -7,6 +7,7 @@ use crate::procchain::{self, Proc};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use taa_platform::preflight::{self, MacosPreflight};
+use taa_tools::auth;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Options {
@@ -29,6 +30,39 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Options, St
     Ok(o)
 }
 
+/// Authentication file facts. Only metadata: the token is never read or shown.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuthFacts {
+    /// The default path; `--token-file` and `[auth] token_file` override it at `serve`.
+    pub token_path: Option<String>,
+    pub exists: bool,
+    /// `owner-only`, `too-open` or `unknown`.
+    pub access: &'static str,
+    pub mode: Option<String>,
+}
+
+fn gather_auth() -> AuthFacts {
+    match auth::default_token_path() {
+        Ok(p) => auth_facts_for(&p),
+        Err(_) => AuthFacts {
+            token_path: None,
+            exists: false,
+            access: auth::Access::Unknown.label(),
+            mode: None,
+        },
+    }
+}
+
+fn auth_facts_for(path: &std::path::Path) -> AuthFacts {
+    let s = auth::inspect(path);
+    AuthFacts {
+        token_path: Some(path.display().to_string()),
+        exists: s.exists,
+        access: s.access.label(),
+        mode: s.mode,
+    }
+}
+
 /// Everything the report needs; built from the real system or from fakes.
 #[derive(Debug)]
 pub struct Facts {
@@ -41,6 +75,7 @@ pub struct Facts {
     pub chain: Vec<Proc>,
     pub ssh: bool,
     pub no_gui: bool,
+    pub auth: AuthFacts,
 }
 
 fn hex(digest: &[u8]) -> String {
@@ -104,6 +139,7 @@ pub fn gather() -> Result<Facts, String> {
         chain: procchain::ancestors(std::process::id()),
         ssh: env("SSH_CONNECTION") || env("SSH_CLIENT") || env("SSH_TTY"),
         no_gui: cfg!(target_os = "linux") && !env("DISPLAY") && !env("WAYLAND_DISPLAY"),
+        auth: gather_auth(),
     })
 }
 
@@ -217,6 +253,9 @@ pub fn hints(f: &Facts) -> Vec<String> {
                 .into(),
         );
     }
+    if f.auth.access == "too-open" {
+        h.push("The agent token file is readable by other users; `serve` will refuse to start until it is restricted or rotated (`tinyagentaccess rotate-token`).".into());
+    }
     h
 }
 
@@ -271,9 +310,16 @@ pub fn render_json(f: &Facts) -> String {
         .iter()
         .map(|p| format!("{{\"pid\":{},\"name\":{}}}", p.pid, esc(&p.name)))
         .collect();
+    let auth = format!(
+        "{{\"required\":true,\"token_path\":{},\"token_file_exists\":{},\"token_file_access\":{},\"token_file_mode\":{}}}",
+        f.auth.token_path.as_deref().map_or("null".into(), esc),
+        f.auth.exists,
+        esc(f.auth.access),
+        f.auth.mode.as_deref().map_or("null".into(), esc),
+    );
     let hints: Vec<String> = hints(f).iter().map(|h| esc(h)).collect();
     format!(
-        "{{\"version\":{},\"binary_path\":{},\"binary_sha256\":{},\"os\":{},\"platform_backend\":{},\"macos\":{},\"process_chain\":[{}],\"likely_host_app\":{},\"hints\":[{}],\"remedy\":{}}}\n",
+        "{{\"version\":{},\"binary_path\":{},\"binary_sha256\":{},\"os\":{},\"platform_backend\":{},\"macos\":{},\"process_chain\":[{}],\"likely_host_app\":{},\"hints\":[{}],\"remedy\":{},\"auth\":{}}}\n",
         esc(&f.version),
         esc(&f.binary_path),
         esc(&f.binary_sha256),
@@ -284,6 +330,7 @@ pub fn render_json(f: &Facts) -> String {
         host.as_deref().map_or("null".into(), esc),
         hints.join(","),
         esc(&remedy(f, host.as_deref())),
+        auth,
     )
 }
 
@@ -333,6 +380,31 @@ pub fn render_text(f: &Facts) -> String {
         let _ = writeln!(s, "hint: {h}");
     }
     let _ = writeln!(s, "remedy: {}", remedy(f, host.as_deref()));
+    let _ = writeln!(
+        s,
+        "auth: serve requires Authorization: Bearer <token> on every /mcp request"
+    );
+    let _ = writeln!(
+        s,
+        "auth token file (default path): {}",
+        f.auth.token_path.as_deref().unwrap_or("unavailable")
+    );
+    let _ = writeln!(
+        s,
+        "auth token file exists: {}",
+        if f.auth.exists {
+            "yes"
+        } else {
+            "no (serve creates the default path on first start)"
+        }
+    );
+    let mode = f
+        .auth
+        .mode
+        .as_deref()
+        .map(|m| format!(" (mode {m})"))
+        .unwrap_or_default();
+    let _ = writeln!(s, "auth token file access: {}{mode}", f.auth.access);
     s
 }
 
@@ -379,6 +451,12 @@ mod tests {
             chain: chain(&["zsh", "iTerm2", "launchd"]),
             ssh: false,
             no_gui: false,
+            auth: AuthFacts {
+                token_path: Some("/state/tinyagentaccess/mcp-token".into()),
+                exists: true,
+                access: "owner-only",
+                mode: Some("0600".into()),
+            },
         }
     }
     fn mac(s: bool, a: bool, k: bool) -> Option<MacosPreflight> {
@@ -509,6 +587,76 @@ mod tests {
         ] {
             assert!(j.contains(key), "missing {key} in {j}");
         }
+    }
+
+    #[test]
+    fn auth_is_reported_in_json_and_text_without_a_token() {
+        let f = facts();
+        let j = render_json(&f);
+        assert!(j.contains("\"auth\":{\"required\":true,\"token_path\":\"/state/tinyagentaccess/mcp-token\",\"token_file_exists\":true,\"token_file_access\":\"owner-only\",\"token_file_mode\":\"0600\"}"), "{j}");
+        let t = render_text(&f);
+        for s in [
+            "auth: serve requires Authorization: Bearer",
+            "auth token file (default path): /state/tinyagentaccess/mcp-token",
+            "auth token file exists: yes",
+            "auth token file access: owner-only (mode 0600)",
+        ] {
+            assert!(t.contains(s), "missing {s} in {t}");
+        }
+        let mut f = facts();
+        f.auth = AuthFacts {
+            token_path: None,
+            exists: false,
+            access: "unknown",
+            mode: None,
+        };
+        assert!(render_json(&f).contains("\"token_path\":null,\"token_file_exists\":false,\"token_file_access\":\"unknown\",\"token_file_mode\":null"));
+        assert!(render_text(&f).contains("unavailable"));
+        f.auth.access = "too-open";
+        assert!(hints(&f).iter().any(|h| h.contains("rotate-token")));
+    }
+
+    #[test]
+    fn auth_facts_report_a_real_token_file_without_its_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp-token");
+        let token = "d".repeat(64);
+        // Missing file: nothing is created or read.
+        let a = auth_facts_for(&path);
+        assert!(!a.exists);
+        assert!(!path.exists());
+        std::fs::write(&path, format!("{token}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let a = auth_facts_for(&path);
+        assert!(a.exists);
+        #[cfg(unix)]
+        {
+            assert_eq!(a.access, "owner-only");
+            assert_eq!(a.mode.as_deref(), Some("0600"));
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let open = auth_facts_for(&path);
+            assert_eq!(open.access, "too-open");
+            assert_eq!(open.mode.as_deref(), Some("0644"));
+        }
+        let mut f = facts();
+        f.auth = auth_facts_for(&path);
+        let (json, text) = (render_json(&f), render_text(&f));
+        let shown = path.display().to_string();
+        assert!(json.contains("\"token_file_exists\":true"), "{json}");
+        for out in [&json, &text, &format!("{:?}", f.auth)] {
+            assert!(!out.contains(&token), "token leaked: {out}");
+        }
+        assert!(text.contains(&shown) || cfg!(windows));
+        // The file content is untouched.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{token}\n")
+        );
     }
 
     #[test]

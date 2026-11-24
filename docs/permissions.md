@@ -1,6 +1,6 @@
 # Desktop permissions
 
-This local server has no authentication. Start it only in the graphical session you intend to control; see SECURITY.md.
+Every `/mcp` request needs a bearer token (see README Authentication), which separates OS users but not processes running as you. Start it only in the graphical session you intend to control; see SECURITY.md.
 
 ## macOS
 

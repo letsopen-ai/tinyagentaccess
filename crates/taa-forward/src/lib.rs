@@ -158,15 +158,24 @@ struct Client {
     alive: Arc<AtomicBool>,
     next: AtomicU64,
 }
+/// §8: command + args, inherited environment, stdio only; kill_on_drop backstop.
+/// TINY-PROPOSAL: `TAA_TOKEN` is the documented *client* variable, so it is
+/// removed from forwarded children even if this server was started from a
+/// shell that exported it. Children can still read the 0600 token file.
+fn launch_command(spec: &ServerSpec) -> Command {
+    let mut command = Command::new(&spec.command);
+    command
+        .args(&spec.args)
+        .env_remove("TAA_TOKEN")
+        .kill_on_drop(true);
+    command
+}
 impl Client {
     fn spawn(spec: &ServerSpec) -> Result<Arc<Self>, Failure> {
-        // §8: command + args, inherited environment, stdio only; kill_on_drop backstop.
-        let mut child = Command::new(&spec.command)
-            .args(&spec.args)
+        let mut child = launch_command(spec)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
             .spawn()
             .map_err(|_| Failure::Unavailable)?;
         let stdout = child.stdout.take().unwrap();
@@ -664,6 +673,21 @@ fn failure_result(message: &str) -> Value {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_path_strips_the_client_token_from_the_child_environment() {
+        let secret = "launch-test-secret-value";
+        std::env::set_var("TAA_TOKEN", secret);
+        let spec = ServerSpec {
+            name: "probe".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), "printf '%s' \"${TAA_TOKEN-unset}\"".into()],
+        };
+        let out = launch_command(&spec).output().await.unwrap();
+        std::env::remove_var("TAA_TOKEN");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset");
+    }
 
     #[tokio::test]
     async fn route_misses_share_completed_refresh_but_lists_always_refresh() {
