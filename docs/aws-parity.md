@@ -1,7 +1,7 @@
 # AWS WorkSpaces "agent access" MCP server (agentaccess-mcp): functional spec for tinyAgentAccess
 
-Status: researched Nov 16, 2026. Revision 2: revises an earlier draft after checking it line by line against the AWS docs and extending it.
-Scope: functional behavior to reproduce in tinyAgentAccess (Rust, letsopen-ai org). Authentication is in §12 only, for later.
+Status: researched Nov 16, 2026. Revision 2: revises an earlier draft after checking it line by line against the AWS docs and extending it. Revision 3 (24 Nov 2026, maintainer-authorized): §12 documents the shipped local token-file departure alongside the existing AWS evidence.
+Scope: functional behavior to reproduce in tinyAgentAccess (Rust, letsopen-ai org). Section 12 covers AWS authentication and the local token-file departure.
 
 tinyAgentAccess is independent and is not affiliated with, endorsed by, or sponsored by Amazon Web Services or Amazon. Amazon WorkSpaces, AWS, and related marks are trademarks of Amazon.com, Inc. or its affiliates. This document independently summarizes and paraphrases AWS public documentation with citations; the [official AWS developer guide](https://docs.aws.amazon.com/appstream2/latest/developerguide/agent-access.html) is authoritative and remains Amazon’s copyright. See [§16](#16-sources) for sources; the AWS sample repository is MIT-0.
 
@@ -392,7 +392,7 @@ Service contract from the sample's tester [S-fwd-contract, sample tester README]
 - Screenshot storage:
   - The MCP server uploads **using the agent's credentials**, so the agent needs `s3:PutObject` [D-session].
   - Key: `agentaccess/screenshots/year=YYYY/month=MM/day=DD/{streaming-session-id}/{timestamp}.png` [D-monitor]. The docs show `.png` even for JPEG; behavior with JPEG is UNKNOWN.
-- **[TINY-PROPOSAL local mapping, M7]** UserControlMode maps to an unauthenticated same-origin `/observe` page: disabled → 404, view_only → watch, view_stop → watch + Stop closing the local MCP session through the normal release path. A new session is required after Stop. PROVISIONAL: Stop flags the session before waiting for current desktop work; sequences check between steps. AWS mid-action semantics are UNKNOWN. This is local screenshot polling, **not DCV**, with no streaming URL or image-builder stop/start. Keep it on loopback. No client_disconnected notification is emitted because its wire form is UNKNOWN [S-retry]. See [design M7](design.md#m7-local-replay-and-human-control).
+- **[TINY-PROPOSAL local mapping, M7]** UserControlMode maps to a same-origin `/observe` page: disabled → 404, `view_only` → watch, `view_stop` → watch + Stop closing the local MCP session through the normal release path. The HTML page itself is unauthenticated; live data and Stop require the observer secret (see [§12](#12-authentication-and-authorization)). A new session is required after Stop. PROVISIONAL: Stop flags the session before waiting for current desktop work; sequences check between steps. AWS mid-action semantics are UNKNOWN. This is local screenshot polling, **not DCV**, with no streaming URL or image-builder stop/start. Keep it on loopback. No client_disconnected notification is emitted because its wire form is UNKNOWN [S-retry]. See [design M7](design.md#m7-local-replay-and-human-control).
 - User control mode [D-session]:
   - Observers watch via a streaming URL in a browser. `VIEW_STOP` shows a stop button.
   - On a stack, after a stop the agent must start a new session. On an image builder, agent access returns only after a stop/start.
@@ -430,7 +430,9 @@ Service contract from the sample's tester [S-fwd-contract, sample tester README]
   - The appstream:Stream check for DJ (`INVALID_AUTH_POLICY`) [D-endpoint, D-session, D-ident-dj].
   - Which internal APIs it calls: UNDOCUMENTED.
 
-## 12. Authentication and authorization (deferred; v1 ships without auth)
+## 12. Authentication and authorization
+
+### AWS AgentAccess documentation and sample behavior
 
 - **SigV4**: service name `agentaccess-mcp`, region = endpoint region, sign every request [D-endpoint]. The SAML `_meta` must be in the body before signing (the signature covers the payload) [D-ident-dj, S-djauth].
 - **OAuth 2.1 via AWS Sign-In** (same as the AWS MCP Server) [D-endpoint]:
@@ -454,6 +456,17 @@ Service contract from the sample's tester [S-fwd-contract, sample tester README]
   - Session tags `AgentAccessAgentId`, `AgentAccessAgentName` (optional), `AgentAccessUserId`.
   - Source identity = streaming user.
 - **Domain-joined fleets**: SAML assertion + stack ARN in `_meta` (§3). Certificate-based auth is required. The stack must be in the signer's account [D-endpoint, D-ident-dj].
+
+### [TINY-PROPOSAL] Shipped local authentication
+
+tinyAgentAccess deliberately departs from the managed IAM/SigV4 and OAuth 2.1 via AWS Sign-In mechanisms documented above [D-sar, D-endpoint]. Local authentication is kept independent of those AWS services, which cannot map to a self-hosted binary with no AWS account, IAM, or AWS Sign-In. The local scheme provides no AWS authentication protocol parity. Local OAuth 2.1 support is deferred.
+
+- **Agent requests.** Every `/mcp` request (POST, GET, and DELETE, including `initialize`) requires exactly one `Authorization: Bearer <token>` header. The server checks it before reading the body and compares tokens in constant time. After Host/Origin checks pass, a missing, incorrect, or duplicate header returns 401 without `WWW-Authenticate` or `resource_metadata`. Those browser checks return 403 first. There is no production no-auth mode.
+- **Token file.** The long-lived agent secret defaults to `tinyagentaccess/mcp-token` under the user state directory. New files are created with mode `0600` on Unix and an owner-only ACL on Windows. Existing Unix files are rejected if any group or other permission bit is set. Existing Windows files must be owned by the current user; their allow ACEs may also include SYSTEM, Administrators, and OWNER RIGHTS (`OWNER RIGHTS` is trusted only after the owner is the current user). A path set by `--token-file` or `[auth] token_file` must already exist, so a typo fails instead of creating a secret. Startup fails closed if a required credential cannot be loaded or fails validation. `rotate-token` replaces only the agent token.
+- **Remote access.** The default listener binds to loopback. The documented remote path is an SSH tunnel to that listener. Wildcard binds are rejected. A concrete non-loopback bind requires both the token and explicit opt-in with `--allow-non-loopback` or `[auth] allow_non_loopback = true`. The server still warns that it has no TLS.
+- **Observer.** The `/observe` live APIs and Stop require a separate secret stored in `observe-token`. The HTML page itself does not require the secret. Browsers omit URL fragments from requests, so the page reads the secret from `/observe#<secret>` and sends it in `X-TAA-Observe-Token`. Neither secret grants access to the other's APIs. Stop does not lock out the agent or rotate its token. Host/Origin checks still apply independently of authentication.
+- **Diagnostics.** `tinyagentaccess doctor` reports the default agent token path, existence, and access status in text and in additive JSON fields. `--token-file` and `[auth] token_file` override that path at `serve`; `doctor` does not inspect the override. It never prints or creates a token.
+- **Residual risk.** Other processes running as the same user can read the token file. Forwarded children can still read the `0600` file even though the launcher strips `TAA_TOKEN` from their environments.
 
 ## 13. Observability (for parity, optional in tiny)
 

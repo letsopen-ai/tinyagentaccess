@@ -18,7 +18,7 @@ All notable changes are recorded here in [Keep a Changelog](https://keepachangel
 - **BREAKING:** a concrete non-loopback bind is rejected unless `--allow-non-loopback` (or `[auth] allow_non_loopback = true`) is set; it still warns that there is no TLS. Wildcard binds remain rejected.
 - Startup now prints the token file path, never the token.
 - `serve` and `observe-url` reject an agent token and observer secret that share a path, a link, or a value. First-time token creation publishes a complete file atomically. `TAA_TOKEN` is removed from forwarded MCP server environments. On Windows a token file must be owned by the current user. For non-loopback binds the observer URL printed is the loopback one, with an SSH-forward note. Interop scripts send the bearer token (`TAA_TOKEN` or `--token-file`).
-- Documentation: README, SECURITY.md, AGENTS.md, `docs/design.md`, and `config.example.toml` describe authentication. `docs/aws-parity.md` §12 still says v1 ships without auth and was intentionally not edited.
+- Documentation: README, SECURITY.md, AGENTS.md, `docs/design.md`, and `config.example.toml` describe authentication. `docs/aws-parity.md` §12 now describes the local token-file departure and retains the AWS SigV4, IAM, and OAuth 2.1 via AWS Sign-In evidence.
 
 ## [0.1.2] - 2026-11-24
 
